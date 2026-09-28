@@ -157,8 +157,8 @@ final class CodexClientTests: XCTestCase {
             ["type": "response.output_item.done", "item": call],
             ["type": "response.completed", "response": ["id": "resp_1", "output": [reasoning, call]]]
         ])) }
-        let client = CodexClient(credentials: CodexCredentials(tokens: fixtureTokens), session: session, model: "gpt-test")
-        let response = try await client.respond(instructions: "Be helpful", input: [CodexAgent.userMessage("hi")], tools: CodexAgent.tools)
+        let client = CodexClient(credentials: CodexCredentials(tokens: fixtureTokens), session: session)
+        let response = try await client.respond(model: "gpt-test", instructions: "Be helpful", input: [CodexAgent.userMessage("hi")], tools: CodexAgent.tools)
         XCTAssertEqual(response.functionCalls, [CodexFunctionCall(callID: "call_1", name: "step", arguments: call["arguments"] as! String)])
         XCTAssertEqual(response.output.count, 2, "Reasoning items are kept for the next turn")
 
@@ -181,14 +181,14 @@ final class CodexClientTests: XCTestCase {
         let failing = StubProtocol.session { _ in (200, sse([["type": "response.failed", "response": ["error": ["message": "boom"]]]])) }
         do {
             _ = try await CodexClient(credentials: CodexCredentials(tokens: fixtureTokens), session: failing)
-                .respond(instructions: "x", input: [], tools: [])
+                .respond(model: "gpt-test", instructions: "x", input: [], tools: [])
             XCTFail("A failed stream must not produce calls")
         } catch let error as CodexServiceError { XCTAssertEqual(error.status, 502) }
 
         let expired = StubProtocol.session { _ in (401, Data(#"{"detail":"Unauthorized"}"#.utf8)) }
         do {
             _ = try await CodexClient(credentials: CodexCredentials(tokens: fixtureTokens), session: expired)
-                .respond(instructions: "x", input: [], tools: [])
+                .respond(model: "gpt-test", instructions: "x", input: [], tools: [])
             XCTFail("Expected an auth error")
         } catch let error as CodexServiceError {
             XCTAssertEqual(error.status, 401)
@@ -207,9 +207,11 @@ final class CodexClientTests: XCTestCase {
 private final class ScriptedPlanner: Planner {
     var turns: [[[String: Any]]]
     var inputs: [[[String: Any]]] = []
+    var models: [String] = []
     init(_ turns: [[[String: Any]]]) { self.turns = turns }
-    func respond(instructions: String, input: [[String: Any]], tools: [[String: Any]], effort: String) async throws -> CodexResponse {
+    func respond(model: String, instructions: String, input: [[String: Any]], tools: [[String: Any]], effort: String) async throws -> CodexResponse {
         inputs.append(input)
+        models.append(model + "/" + effort)
         return CodexResponse(output: turns.isEmpty ? [] : turns.removeFirst())
     }
 }
@@ -240,14 +242,37 @@ private func act(_ id: String, _ steps: [(String, String?)], summary: String?) -
     call(id, "act", ["steps": steps.map { ["instruction": $0.0, "text": $0.1 as Any? ?? NSNull()] }, "summary": summary])
 }
 
+private let fast = PlannerTier(model: "gpt-6-luna", effort: "none")
+
 @MainActor
 final class CodexAgentTests: XCTestCase {
+    func testFailedPlanEscalatesToStrongTierWithoutForeignReasoning() async throws {
+        let reasoning: [String: Any] = ["type": "reasoning", "id": "rs_1", "encrypted_content": "luna-only"]
+        let planner = ScriptedPlanner([
+            [reasoning, act("c1", [("Click Search", nil)], summary: "Searched.")],
+            [call("c2", "done", ["summary": "ok"])]
+        ])
+        let layer = RecordingLayer()
+        layer.statuses = ["blocked"]
+        let outcome = try await CodexAgent(planner: planner, tier: fast, escalation: .strong).run(goal: "g", appName: "App", layer: layer)
+        XCTAssertEqual(outcome, .done("ok"))
+        XCTAssertEqual(planner.models, ["gpt-6-luna/none", "gpt-6-sol/low"])
+        XCTAssertFalse(planner.inputs[1].contains { $0["type"] as? String == "reasoning" })
+        XCTAssertEqual(planner.inputs[1].filter { $0["type"] as? String == "function_call_output" }.count, 1)
+    }
+
+    func testSuccessfulPlanNeverEscalates() async throws {
+        let planner = ScriptedPlanner([[act("c1", [("Click Search", nil)], summary: "Done.")]])
+        _ = try await CodexAgent(planner: planner, tier: fast, escalation: .strong).run(goal: "g", appName: "App", layer: RecordingLayer())
+        XCTAssertEqual(planner.models, ["gpt-6-luna/none"])
+    }
+
     func testWholeTaskRunsFromOnePlannerTurn() async throws {
         let planner = ScriptedPlanner([[act("c1", [("Click the Search field", nil),
                                                    ("Type into the search field", "Adele — Skyfall (2012)"),
                                                    ("Press Return", nil)], summary: "Searched for Skyfall.")]])
         let layer = RecordingLayer()
-        let outcome = try await CodexAgent(planner: planner).run(goal: "search skyfall", appName: "Spotify", layer: layer)
+        let outcome = try await CodexAgent(planner: planner, tier: fast).run(goal: "search skyfall", appName: "Spotify", layer: layer)
         XCTAssertEqual(outcome, .done("Searched for Skyfall."))
         XCTAssertEqual(planner.inputs.count, 1)
         XCTAssertEqual(layer.steps.map(\.0), ["Click the Search field", "Type into the search field", "Press Return"])
@@ -262,7 +287,7 @@ final class CodexAgentTests: XCTestCase {
         ])
         let layer = RecordingLayer()
         layer.statuses = ["verified", "blocked"]
-        let outcome = try await CodexAgent(planner: planner).run(goal: "g", appName: "App", layer: layer)
+        let outcome = try await CodexAgent(planner: planner, tier: fast).run(goal: "g", appName: "App", layer: layer)
         XCTAssertEqual(outcome, .failed("No search field."))
         XCTAssertEqual(layer.steps.count, 2, "Steps after a failure are not run")
         let output = try XCTUnwrap(planner.inputs[1].last?["output"] as? String)
@@ -276,7 +301,7 @@ final class CodexAgentTests: XCTestCase {
         let planner = ScriptedPlanner([[act("c1", [("Type the command", "ls -la"), ("Press Return", nil)], summary: "Listed files.")]])
         let layer = RecordingLayer()
         layer.statuses = ["sent", "verified"]
-        let outcome = try await CodexAgent(planner: planner).run(goal: "list files", appName: "Terminal", layer: layer)
+        let outcome = try await CodexAgent(planner: planner, tier: fast).run(goal: "list files", appName: "Terminal", layer: layer)
         XCTAssertEqual(outcome, .done("Listed files."))
     }
 
@@ -286,7 +311,7 @@ final class CodexAgentTests: XCTestCase {
             [act("c2", [("Click Search again", nil)], summary: nil)],
             [call("c3", "done", ["summary": "ok"])]
         ])
-        _ = try await CodexAgent(planner: planner).run(goal: "g", appName: "App", layer: RecordingLayer())
+        _ = try await CodexAgent(planner: planner, tier: fast).run(goal: "g", appName: "App", layer: RecordingLayer())
         let last = planner.inputs[2]
         let serialized = String(decoding: try JSONSerialization.data(withJSONObject: last), as: UTF8.self)
         XCTAssertFalse(serialized.contains("Current screen"), "The opening screen is compacted after a step")
@@ -302,7 +327,7 @@ final class CodexAgentTests: XCTestCase {
             [call("c3", "fail", ["reason": "Needs sign-in."])]
         ])
         let layer = RecordingLayer()
-        let outcome = try await CodexAgent(planner: planner).run(goal: "g", appName: "App", layer: layer)
+        let outcome = try await CodexAgent(planner: planner, tier: fast).run(goal: "g", appName: "App", layer: layer)
         XCTAssertEqual(outcome, .failed("Needs sign-in."))
         XCTAssertEqual(layer.steps.map(\.0), ["Click A"])
         let outputs = planner.inputs[1].filter { $0["type"] as? String == "function_call_output" }.map { $0["call_id"] as? String }
@@ -313,7 +338,7 @@ final class CodexAgentTests: XCTestCase {
         let message: [String: Any] = ["type": "message", "role": "assistant", "content": [["type": "output_text", "text": "I can't do that."]]]
         let planner = ScriptedPlanner([[message], [message]])
         let layer = RecordingLayer()
-        let outcome = try await CodexAgent(planner: planner).run(goal: "g", appName: "App", layer: layer)
+        let outcome = try await CodexAgent(planner: planner, tier: fast).run(goal: "g", appName: "App", layer: layer)
         XCTAssertEqual(outcome, .failed("I can't do that."))
         XCTAssertEqual(planner.inputs.count, 2)
         XCTAssertTrue(layer.steps.isEmpty)
@@ -325,7 +350,7 @@ final class CodexAgentTests: XCTestCase {
             [call("c2", "done", ["summary": "ok"])]
         ])
         let layer = RecordingLayer()
-        _ = try await CodexAgent(planner: planner).run(goal: "g", appName: "App", layer: layer)
+        _ = try await CodexAgent(planner: planner, tier: fast).run(goal: "g", appName: "App", layer: layer)
         XCTAssertTrue(layer.steps.isEmpty, "A plan with any invalid step sends no input")
         let output = planner.inputs[1].last?["output"] as? String
         XCTAssertTrue(output?.contains("rejected") == true)
@@ -336,5 +361,40 @@ final class CodexAgentTests: XCTestCase {
         let parameters = act["parameters"] as! [String: Any]
         XCTAssertEqual(parameters["required"] as? [String], ["steps", "summary"])
         XCTAssertEqual(act["strict"] as? Bool, true)
+    }
+}
+
+@MainActor
+final class PlannerRoutingTests: XCTestCase {
+    func testRoutingDecodesTierAndRejectsUnknownChoices() {
+        func answer(_ model: String, _ effort: String) -> Data {
+            Data(#"{"answers":{"planner_model":{"choice":"\#(model)"},"planner_effort":{"choice":"\#(effort)"}}}"#.utf8)
+        }
+        XCTAssertEqual(JevClient.decodeTier(answer("luna", "none")), PlannerTier(model: "gpt-6-luna", effort: "none"))
+        XCTAssertEqual(JevClient.decodeTier(answer("sol", "low")), PlannerTier(model: "gpt-6-sol", effort: "low"))
+        XCTAssertNil(JevClient.decodeTier(answer("gpt-9", "low")))
+        XCTAssertNil(JevClient.decodeTier(answer("luna", "high")))
+    }
+
+    func testRoutingFailureFallsBackToStrongTier() async {
+        let session = StubProtocol.session { _ in (500, Data()) }
+        let tier = await JevClient(apiKey: "k", session: session).choosePlannerTier(goal: "search", appName: "Spotify")
+        XCTAssertEqual(tier, .strong)
+        let body = try! JSONSerialization.jsonObject(with: StubProtocol.requests[0].httpBody!) as! [String: Any]
+        XCTAssertEqual(Set((body["questions"] as! [String: Any]).keys), ["planner_model", "planner_effort"])
+    }
+
+    func testRejectedEffortRetriesWithLow() async throws {
+        let done = sse([["type": "response.completed", "response": ["output": [
+            ["type": "function_call", "call_id": "c", "name": "done", "arguments": #"{"summary":"ok"}"#]]]]])
+        let session = StubProtocol.session { request in
+            let body = try! JSONSerialization.jsonObject(with: request.httpBody!) as! [String: Any]
+            let effort = (body["reasoning"] as! [String: Any])["effort"] as! String
+            return effort == "minimal" ? (400, Data(#"{"error":{"message":"Unsupported value: minimal"}}"#.utf8)) : (200, done)
+        }
+        let client = CodexClient(credentials: CodexCredentials(tokens: fixtureTokens), session: session)
+        let response = try await client.respond(model: "gpt-6-luna", instructions: "x", input: [], tools: [], effort: "minimal")
+        XCTAssertEqual(response.functionCalls.first?.name, "done")
+        XCTAssertEqual(StubProtocol.requests.count, 2)
     }
 }

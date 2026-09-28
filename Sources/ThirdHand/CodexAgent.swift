@@ -10,6 +10,13 @@ struct StepOutcome {
     var succeeded: Bool { ["verified", "step_complete", "sent"].contains(status) }
 }
 
+struct PlannerTier: Equatable {
+    let model: String
+    let effort: String
+
+    nonisolated static let strong = PlannerTier(model: CodexClient.strongModel, effort: "low")
+}
+
 enum AgentOutcome: Equatable {
     case done(String)
     case failed(String)
@@ -17,7 +24,7 @@ enum AgentOutcome: Equatable {
 
 @MainActor
 protocol Planner: AnyObject {
-    func respond(instructions: String, input: [[String: Any]], tools: [[String: Any]], effort: String) async throws -> CodexResponse
+    func respond(model: String, instructions: String, input: [[String: Any]], tools: [[String: Any]], effort: String) async throws -> CodexResponse
 }
 
 extension CodexClient: Planner {}
@@ -38,7 +45,15 @@ final class CodexAgent {
     nonisolated static let maxScreenCharacters = 20_000
 
     private let planner: Planner
-    init(planner: Planner) { self.planner = planner }
+    private var tier: PlannerTier
+    private let escalation: PlannerTier?
+
+    /// Plans start on `tier`; after a failed plan, replanning moves to `escalation` if given.
+    init(planner: Planner, tier: PlannerTier, escalation: PlannerTier? = nil) {
+        self.planner = planner
+        self.tier = tier
+        self.escalation = escalation
+    }
 
     nonisolated static let instructions = """
     You are Third Hand, a macOS assistant that completes tasks in the app the user has focused. \
@@ -145,13 +160,20 @@ final class CodexAgent {
         let opening = "Task: \(goal)\nApp: \(appName)"
         var input: [[String: Any]] = [Self.userMessage(opening + "\n\nCurrent screen:\n" + Self.describe(try await layer.currentElements()))]
         // Only the newest screen is sent in full; older ones are replaced to bound the context.
-        var screenItem: (index: Int, compact: [String: Any])? = (0, Self.userMessage(opening))
+        // The opening message is always input[0]; step screens are found by call ID.
+        var screenItem: (callID: String?, compact: [String: Any]) = (nil, Self.userMessage(opening))
+        func compactPreviousScreen() {
+            let index = screenItem.callID.flatMap { id in
+                input.firstIndex { $0["type"] as? String == "function_call_output" && $0["call_id"] as? String == id }
+            } ?? 0
+            input[index] = screenItem.compact
+        }
         var nudged = false
 
         for turn in 0..<Self.maxTurns {
             try Task.checkCancellation()
             status(turn == 0 ? "Planning…" : "Replanning…")
-            let response = try await planner.respond(instructions: Self.instructions, input: input, tools: Self.tools, effort: "low")
+            let response = try await planner.respond(model: tier.model, instructions: Self.instructions, input: input, tools: Self.tools, effort: tier.effort)
             input.append(contentsOf: response.output)
             guard let call = response.functionCalls.first else {
                 let text = response.text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -197,12 +219,20 @@ final class CodexAgent {
                 if results.count < steps.count {
                     results.append(["not_run": Array((results.count + 1)...steps.count)])
                 }
+                if !completed, let escalation, escalation != tier {
+                    Log.info("Planner escalating from=\(tier.model)/\(tier.effort) to=\(escalation.model)/\(escalation.effort)")
+                    if escalation.model != tier.model {
+                        // Encrypted reasoning belongs to the model that produced it; drop it when switching.
+                        input.removeAll { $0["type"] as? String == "reasoning" }
+                    }
+                    tier = escalation
+                }
                 let result: [String: Any] = ["completed_all_steps": completed, "results": results]
-                if let screenItem { input[screenItem.index] = screenItem.compact }
+                compactPreviousScreen()
                 var full = result
                 full["screen"] = Self.describe(last?.elements ?? [])
                 input.append(["type": "function_call_output", "call_id": call.callID, "output": Self.json(full)])
-                screenItem = (input.count - 1, ["type": "function_call_output", "call_id": call.callID, "output": Self.json(result)])
+                screenItem = (call.callID, ["type": "function_call_output", "call_id": call.callID, "output": Self.json(result)])
             default:
                 input.append(["type": "function_call_output", "call_id": call.callID, "output": Self.rejection("Unknown tool. Use act, done, or fail.")])
             }

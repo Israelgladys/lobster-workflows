@@ -230,6 +230,57 @@ final class JevClient {
         return try Self.decode(data, elements: elements, latencyMs: ms, offered: offered)
     }
 
+    nonisolated static func routingBody(goal: String, appName: String) -> [String: Any] {
+        ["model": "jev-latest", "state": ["task": goal, "app": appName],
+         "questions": [
+            "planner_model": ["type": "choice", "criteria": [
+                "luna": "Short, well-specified UI task: search, open, play, click or toggle something, or enter text the user supplied",
+                "sol": "Needs judgment or composition: several goals, writing new text, comparing or choosing among options, or unfamiliar multi-screen workflows"
+            ], "instructions": "Which planner does this computer-use task need? Prefer luna unless the task clearly needs more reasoning."] as [String: Any],
+            "planner_effort": ["type": "choice", "criteria": [
+                "none": "The steps are obvious from the request",
+                "low": "The steps need some thought about the app or the order of actions"
+            ], "instructions": "How much planning effort does this task need?"] as [String: Any]
+         ] as [String: Any]]
+    }
+
+    nonisolated static func decodeTier(_ data: Data) -> PlannerTier? {
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let answers = json["answers"] as? [String: Any],
+              let model = (answers["planner_model"] as? [String: Any])?["choice"] as? String,
+              let effort = (answers["planner_effort"] as? [String: Any])?["choice"] as? String,
+              ["none", "low"].contains(effort) else { return nil }
+        switch model {
+        case "luna": return PlannerTier(model: CodexClient.fastModel, effort: effort)
+        case "sol": return PlannerTier(model: CodexClient.strongModel, effort: effort)
+        default: return nil
+        }
+    }
+
+    /// Picks the planner model and effort for a task; falls back to the strong tier on any failure.
+    func choosePlannerTier(goal: String, appName: String) async -> PlannerTier {
+        do {
+            var request = URLRequest(url: endpoint, timeoutInterval: 5)
+            request.httpMethod = "POST"
+            request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = try JSONSerialization.data(withJSONObject: Self.routingBody(goal: String(goal.prefix(2000)), appName: appName))
+            let start = Date()
+            let (data, response) = try await AsyncTimeout.run(seconds: 5, message: "Routing timed out.") { [session] in
+                try await session.data(for: request)
+            }
+            Log.info("Timing jev_route_ms=\(Int(Date().timeIntervalSince(start) * 1000))")
+            guard (response as? HTTPURLResponse)?.statusCode == 200, let tier = Self.decodeTier(data) else {
+                Log.info("Planner routing unusable; using strong tier")
+                return .strong
+            }
+            return tier
+        } catch {
+            Log.info("Planner routing failed; using strong tier")
+            return .strong
+        }
+    }
+
     nonisolated static func errorDetail(_ data: Data, redacting key: String) -> String {
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return "The service returned no readable validation detail."

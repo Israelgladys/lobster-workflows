@@ -38,17 +38,21 @@ struct CodexResponse {
 final class CodexClient {
     nonisolated static let endpoint = URL(string: "https://chatgpt.com/backend-api/codex/responses")!
     nonisolated static let originator = "third_hand"
-    nonisolated static let defaultModel = "gpt-6-sol"
-    nonisolated static var model: String { UserDefaults.standard.string(forKey: "CodexModel") ?? defaultModel }
+    nonisolated static let fastModel = "gpt-6-luna"
+    nonisolated static let strongModel = "gpt-6-sol"
+    /// A fixed model from `defaults write com.thirdhand.app CodexModel <model>` disables routing.
+    nonisolated static var modelOverride: String? { UserDefaults.standard.string(forKey: "CodexModel") }
+    /// A fixed effort from `defaults write com.thirdhand.app CodexEffort <effort>` overrides routing.
+    nonisolated static var effortOverride: String? { UserDefaults.standard.string(forKey: "CodexEffort") }
+    /// Efforts the backend rejected (for example an unsupported level); later requests use "low" instead.
+    private static var rejectedEfforts: Set<String> = []
 
     private let credentials: CodexCredentials
     private let session: URLSession
-    let model: String
 
-    init(credentials: CodexCredentials, session: URLSession = .shared, model: String = CodexClient.model) {
+    init(credentials: CodexCredentials, session: URLSession = .shared) {
         self.credentials = credentials
         self.session = session
-        self.model = model
     }
 
     nonisolated static func requestBody(model: String, instructions: String, input: [[String: Any]],
@@ -58,8 +62,19 @@ final class CodexClient {
          "reasoning": ["effort": effort], "include": ["reasoning.encrypted_content"]]
     }
 
-    func respond(instructions: String, input: [[String: Any]], tools: [[String: Any]],
+    func respond(model: String, instructions: String, input: [[String: Any]], tools: [[String: Any]],
                  effort: String = "low") async throws -> CodexResponse {
+        let effective = Self.rejectedEfforts.contains(model + "/" + effort) ? "low" : effort
+        do { return try await send(model: model, instructions: instructions, input: input, tools: tools, effort: effective) }
+        catch let error as CodexServiceError where error.status == 400 && effective != "low" {
+            Log.info("Codex rejected effort=\(effective); retrying with low")
+            Self.rejectedEfforts.insert(model + "/" + effective)
+            return try await send(model: model, instructions: instructions, input: input, tools: tools, effort: "low")
+        }
+    }
+
+    private func send(model: String, instructions: String, input: [[String: Any]], tools: [[String: Any]],
+                      effort: String) async throws -> CodexResponse {
         let tokens = try await credentials.current()
         var request = URLRequest(url: Self.endpoint, timeoutInterval: 120)
         request.httpMethod = "POST"
@@ -70,7 +85,7 @@ final class CodexClient {
         request.setValue(Self.originator, forHTTPHeaderField: "originator")
         request.httpBody = try JSONSerialization.data(withJSONObject: Self.requestBody(
             model: model, instructions: instructions, input: input, tools: tools, effort: effort))
-        Log.info("Codex request model=\(model) bytes=\(request.httpBody?.count ?? 0) items=\(input.count)")
+        Log.info("Codex request model=\(model) effort=\(effort) bytes=\(request.httpBody?.count ?? 0) items=\(input.count)")
         let start = Date()
         let session = session
         let response = try await AsyncTimeout.run(seconds: 120, message: "The planner timed out.") {
@@ -82,11 +97,26 @@ final class CodexClient {
                 throw Self.serviceError(status: status, body: body)
             }
             var events: [[String: Any]] = []
+            var marks: [String: Int] = [:]
+            func mark(_ name: String) { if marks[name] == nil { marks[name] = Int(Date().timeIntervalSince(start) * 1000) } }
+            mark("headers")
             for try await line in bytes.lines {
                 guard let event = Self.event(fromLine: line) else { continue }
                 events.append(event)
+                mark("first_event")
+                if event["type"] as? String == "response.output_item.added",
+                   let type = (event["item"] as? [String: Any])?["type"] as? String { mark(type) }
+                if event["type"] as? String == "response.completed" {
+                    let usage = (event["response"] as? [String: Any])?["usage"] as? [String: Any]
+                    let input = usage?["input_tokens"] as? Int ?? -1
+                    let cached = (usage?["input_tokens_details"] as? [String: Any])?["cached_tokens"] as? Int ?? -1
+                    let output = usage?["output_tokens"] as? Int ?? -1
+                    let reasoning = (usage?["output_tokens_details"] as? [String: Any])?["reasoning_tokens"] as? Int ?? -1
+                    Log.info("Codex usage input=\(input) cached=\(cached) output=\(output) reasoning=\(reasoning)")
+                }
                 if ["response.completed", "response.failed", "response.incomplete", "error"].contains(event["type"] as? String ?? "") { break }
             }
+            Log.info("Codex stream " + marks.sorted { $0.value < $1.value }.map { "\($0.key)_ms=\($0.value)" }.joined(separator: " "))
             return try Self.collect(events)
         }
         try Task.checkCancellation()
