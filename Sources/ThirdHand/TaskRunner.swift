@@ -76,13 +76,6 @@ final class TaskRunner: ActionLayer {
 
     private func runAgent() async throws {
         guard AXIsProcessTrusted() else { throw ControllerError.invalid("Enable Accessibility for Third Hand in System Settings.") }
-        // Route while the app activates; a manual model or effort setting skips routing.
-        let override = (CodexClient.modelOverride, CodexClient.effortOverride)
-        let routing = Task { [jev, goal, name = target.name] in
-            override.0 != nil && override.1 != nil ? PlannerTier(model: override.0!, effort: override.1!)
-                : await jev.choosePlannerTier(goal: goal, appName: name)
-        }
-        defer { routing.cancel() }
         target.application.activate()
         try await Task.sleep(nanoseconds: 400_000_000)
         try checkFocus()
@@ -97,11 +90,12 @@ final class TaskRunner: ActionLayer {
         AXUIElementSetAttributeValue(target.appElement, "AXManualAccessibility" as CFString, kCFBooleanTrue)
         AXUIElementSetAttributeValue(target.appElement, "AXEnhancedUserInterface" as CFString, kCFBooleanTrue)
         phase = "planning"
-        let routed = await routing.value
-        let tier = PlannerTier(model: override.0 ?? routed.model, effort: override.1 ?? routed.effort)
+        // Plan quickly and escalate effort only after a failed plan; manual settings pin the tier.
+        let override = (CodexClient.modelOverride, CodexClient.effortOverride)
+        let tier = PlannerTier(model: override.0 ?? PlannerTier.quick.model, effort: override.1 ?? PlannerTier.quick.effort)
         Log.info("Planner tier model=\(tier.model) effort=\(tier.effort)")
         let agent = CodexAgent(planner: CodexClient(credentials: credentials), tier: tier,
-                               escalation: override.0 == nil ? .strong : nil)
+                               escalation: override.0 == nil && override.1 == nil ? .strong : nil)
         let outcome = try await agent.run(goal: goal, appName: target.name, layer: self) { [weak self] status in
             guard let self else { return }
             self.delegate?.taskRunner(self, status: status)

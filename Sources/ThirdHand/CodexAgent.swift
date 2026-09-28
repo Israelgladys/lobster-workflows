@@ -15,7 +15,7 @@ struct PlannerTier: Equatable {
     let effort: String
 
     nonisolated static let strong = PlannerTier(model: CodexClient.strongModel, effort: "low")
-    /// Used when routing is slow or fails; a failed plan still escalates to `strong`.
+    /// The default: plans start here and a failed plan escalates to `strong`.
     nonisolated static let quick = PlannerTier(model: CodexClient.strongModel, effort: "none")
 }
 

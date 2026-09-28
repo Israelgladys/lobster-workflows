@@ -36,8 +36,8 @@ The app runs on macOS 14+. Apple Intelligence is not required.
 
 - **Accessibility** reads controls and their current values.
 - **Apple Vision** reads screen text locally when needed. Screenshots aren’t uploaded.
-- **ChatGPT (Codex)** plans the task one step at a time and writes any text to enter: search terms, messages, commands. Your request, app name, screen labels and values, and step results are sent to OpenAI through your ChatGPT account. The model defaults to `gpt-6-sol`; override it with `defaults write com.thirdhand.app CodexModel <model>`.
-- **Jev** grounds each step to a control on screen and Third Hand executes and verifies it. The step, app name, screen labels and values, and recent action history are sent to TypeSafe.
+- **ChatGPT (Codex)** plans the whole task in one go as a list of simple steps (click, type, press, scroll, wait), naming each control by its on-screen label, and writes any text to enter: search terms, messages, commands. It's asked again only if a step fails. Your request, app name, screen labels and values, and step results are sent to OpenAI through your ChatGPT account. Planning uses `gpt-6-sol` with no reasoning effort, and retries with low effort after a failed step; pin either with `defaults write com.thirdhand.app CodexModel <model>` or `CodexEffort <effort>`.
+- **Jev** picks the control when a step's label is ambiguous or doesn't match exactly, choosing only among controls that fit the step. Third Hand then executes and verifies each step. The step, app name, and candidate labels and values are sent to TypeSafe.
 - Third Hand is **not offline**.
 
 No bundled model weights or extra runtime dependencies. Third Hand never restarts the apps it controls.

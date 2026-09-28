@@ -390,24 +390,7 @@ final class CodexAgentTests: XCTestCase {
 }
 
 @MainActor
-final class PlannerRoutingTests: XCTestCase {
-    func testRoutingDecodesTierAndRejectsUnknownChoices() {
-        func answer(_ effort: String) -> Data {
-            Data(#"{"answers":{"planner_effort":{"choice":"\#(effort)"}}}"#.utf8)
-        }
-        XCTAssertEqual(JevClient.decodeTier(answer("none")), PlannerTier(model: "gpt-6-sol", effort: "none"))
-        XCTAssertEqual(JevClient.decodeTier(answer("low")), PlannerTier(model: "gpt-6-sol", effort: "low"))
-        XCTAssertNil(JevClient.decodeTier(answer("high")))
-    }
-
-    func testRoutingFailureFallsBackToQuickTier() async {
-        let session = StubProtocol.session { _ in (500, Data()) }
-        let tier = await JevClient(apiKey: "k", session: session).choosePlannerTier(goal: "search", appName: "Spotify")
-        XCTAssertEqual(tier, .quick)
-        let body = try! JSONSerialization.jsonObject(with: StubProtocol.requests[0].httpBody!) as! [String: Any]
-        XCTAssertEqual(Set((body["questions"] as! [String: Any]).keys), ["planner_effort"])
-    }
-
+final class PlannerEffortTests: XCTestCase {
     func testRejectedEffortRetriesWithLow() async throws {
         let done = sse([["type": "response.completed", "response": ["output": [
             ["type": "function_call", "call_id": "c", "name": "done", "arguments": #"{"summary":"ok"}"#]]]]])

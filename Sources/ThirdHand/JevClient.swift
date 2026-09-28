@@ -6,7 +6,7 @@ struct JevServiceError: LocalizedError {
     var errorDescription: String? { "Jev rejected the request (HTTP \(status)): \(detail)" }
 }
 
-/// Jev resolves a planner step's label to one on-screen element and routes tasks to a planner tier.
+/// Jev resolves a planner step's label to one on-screen element.
 /// It never chooses the kind of action: the planner fixes that before Jev is asked.
 @MainActor
 final class JevClient {
@@ -143,51 +143,6 @@ final class JevClient {
             throw JevServiceError(status: code, detail: detail)
         }
         return try Self.decodeGround(data, offered: prepared.offered)
-    }
-
-    // MARK: - Planner routing
-
-    nonisolated static func routingBody(goal: String, appName: String) -> [String: Any] {
-        ["model": "jev-latest", "state": ["task": goal, "app": appName],
-         "questions": [
-            "planner_effort": ["type": "choice", "criteria": [
-                "none": "Short, well-specified UI task whose steps are obvious: search, open, play, click or toggle something, or enter text the user supplied",
-                "low": "Needs judgment or composition: several goals, writing new text, comparing or choosing among options, or unfamiliar multi-screen workflows"
-            ], "instructions": "How much planning effort does this computer-use task need? Prefer none unless the task clearly needs more reasoning."] as [String: Any]
-         ] as [String: Any]]
-    }
-
-    nonisolated static func decodeTier(_ data: Data) -> PlannerTier? {
-        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let answers = json["answers"] as? [String: Any],
-              let effort = (answers["planner_effort"] as? [String: Any])?["choice"] as? String,
-              ["none", "low"].contains(effort) else { return nil }
-        return PlannerTier(model: CodexClient.strongModel, effort: effort)
-    }
-
-    /// Picks the planner effort for a task (gpt-6-luna was no faster and less reliable at finishing plans);
-    /// Routing is an optimization, so it gets `timeout` seconds and falls back to the quick tier.
-    func choosePlannerTier(goal: String, appName: String, timeout: TimeInterval = 1) async -> PlannerTier {
-        let start = Date()
-        do {
-            var request = URLRequest(url: endpoint, timeoutInterval: timeout)
-            request.httpMethod = "POST"
-            request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
-            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            request.httpBody = try JSONSerialization.data(withJSONObject: Self.routingBody(goal: String(goal.prefix(2000)), appName: appName))
-            let (data, response) = try await AsyncTimeout.run(seconds: timeout, message: "Routing timed out.") { [session] in
-                try await session.data(for: request)
-            }
-            Log.info("Timing jev_route_ms=\(Int(Date().timeIntervalSince(start) * 1000))")
-            guard (response as? HTTPURLResponse)?.statusCode == 200, let tier = Self.decodeTier(data) else {
-                Log.info("Planner routing unusable status=\((response as? HTTPURLResponse)?.statusCode ?? 0); using quick tier")
-                return .quick
-            }
-            return tier
-        } catch {
-            Log.info("Planner routing failed after_ms=\(Int(Date().timeIntervalSince(start) * 1000)) error_type=\(String(reflecting: type(of: error))); using quick tier")
-            return .quick
-        }
     }
 
     nonisolated static func errorDetail(_ data: Data, redacting key: String) -> String {

@@ -39,9 +39,9 @@ final class CodexClient {
     nonisolated static let endpoint = URL(string: "https://chatgpt.com/backend-api/codex/responses")!
     nonisolated static let originator = "third_hand"
     nonisolated static let strongModel = "gpt-6-sol"
-    /// A fixed model from `defaults write com.thirdhand.app CodexModel <model>` disables routing.
+    /// A fixed model from `defaults write com.thirdhand.app CodexModel <model>` pins the planner model and disables escalation.
     nonisolated static var modelOverride: String? { UserDefaults.standard.string(forKey: "CodexModel") }
-    /// A fixed effort from `defaults write com.thirdhand.app CodexEffort <effort>` overrides routing.
+    /// A fixed effort from `defaults write com.thirdhand.app CodexEffort <effort>` pins the planner effort and disables escalation.
     nonisolated static var effortOverride: String? { UserDefaults.standard.string(forKey: "CodexEffort") }
     /// Efforts the backend rejected (for example an unsupported level); later requests use "low" instead.
     private static var rejectedEfforts: Set<String> = []
