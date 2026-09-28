@@ -166,27 +166,27 @@ final class JevClient {
     }
 
     /// Picks the planner effort for a task (gpt-6-luna was no faster and less reliable at finishing plans);
-    /// falls back to the strong tier on any failure.
-    func choosePlannerTier(goal: String, appName: String) async -> PlannerTier {
+    /// Routing is an optimization, so it gets `timeout` seconds and falls back to the quick tier.
+    func choosePlannerTier(goal: String, appName: String, timeout: TimeInterval = 1) async -> PlannerTier {
+        let start = Date()
         do {
-            var request = URLRequest(url: endpoint, timeoutInterval: 5)
+            var request = URLRequest(url: endpoint, timeoutInterval: timeout)
             request.httpMethod = "POST"
             request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
             request.httpBody = try JSONSerialization.data(withJSONObject: Self.routingBody(goal: String(goal.prefix(2000)), appName: appName))
-            let start = Date()
-            let (data, response) = try await AsyncTimeout.run(seconds: 5, message: "Routing timed out.") { [session] in
+            let (data, response) = try await AsyncTimeout.run(seconds: timeout, message: "Routing timed out.") { [session] in
                 try await session.data(for: request)
             }
             Log.info("Timing jev_route_ms=\(Int(Date().timeIntervalSince(start) * 1000))")
             guard (response as? HTTPURLResponse)?.statusCode == 200, let tier = Self.decodeTier(data) else {
-                Log.info("Planner routing unusable; using strong tier")
-                return .strong
+                Log.info("Planner routing unusable status=\((response as? HTTPURLResponse)?.statusCode ?? 0); using quick tier")
+                return .quick
             }
             return tier
         } catch {
-            Log.info("Planner routing failed; using strong tier")
-            return .strong
+            Log.info("Planner routing failed after_ms=\(Int(Date().timeIntervalSince(start) * 1000)) error_type=\(String(reflecting: type(of: error))); using quick tier")
+            return .quick
         }
     }
 

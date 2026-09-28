@@ -400,10 +400,10 @@ final class PlannerRoutingTests: XCTestCase {
         XCTAssertNil(JevClient.decodeTier(answer("high")))
     }
 
-    func testRoutingFailureFallsBackToStrongTier() async {
+    func testRoutingFailureFallsBackToQuickTier() async {
         let session = StubProtocol.session { _ in (500, Data()) }
         let tier = await JevClient(apiKey: "k", session: session).choosePlannerTier(goal: "search", appName: "Spotify")
-        XCTAssertEqual(tier, .strong)
+        XCTAssertEqual(tier, .quick)
         let body = try! JSONSerialization.jsonObject(with: StubProtocol.requests[0].httpBody!) as! [String: Any]
         XCTAssertEqual(Set((body["questions"] as! [String: Any]).keys), ["planner_effort"])
     }
@@ -429,6 +429,24 @@ final class PlanValidationTests: XCTestCase {
         let args: [String: Any] = ["steps": [["action": "click", "target": "Play"], ["action": "type", "target": "Search"]]]
         guard case .failure(let error) = CodexAgent.plan(from: args) else { return XCTFail("Missing text must reject the plan") }
         XCTAssertTrue(error.localizedDescription.hasPrefix("Step 2:"))
+    }
+
+    func testScreenKeepsControlsAndEvidenceButBoundsOtherText() {
+        func el(_ id: Int, _ role: String, _ label: String?, focused: Bool = false) -> AccessibilityElement {
+            AccessibilityElement(id: id, role: role, label: label, value: nil, enabled: true, actions: [], axElement: nil, focused: focused)
+        }
+        var elements = [el(1, "AXButton", "Play"), el(2, "AXButton", nil), el(3, "AXTextField", "Search", focused: true),
+                        el(4, "AXGroup", "Now playing: Skyfall"), el(5, "AXButton", "Play")]
+        elements += (100..<200).map { el($0, "AXStaticText", "Caption \($0)") }
+        elements.append(el(900, "AXRow", "Nights · Song"))
+        let screen = CodexAgent.describe(elements)
+        XCTAssertEqual(screen.components(separatedBy: "button \"Play\"").count - 1, 1, "Exact duplicates collapse")
+        XCTAssertFalse(screen.contains("(unlabeled)"))
+        XCTAssertTrue(screen.contains("textField \"Search\" [focused]"))
+        XCTAssertTrue(screen.contains("Now playing: Skyfall"))
+        XCTAssertTrue(screen.contains("row \"Nights · Song\""), "Controls after the text budget are still listed")
+        XCTAssertEqual(screen.components(separatedBy: "staticText").count - 1, CodexAgent.maxContextLines)
+        XCTAssertTrue(screen.contains("60 more non-interactive elements omitted"))
     }
 
     func testStepSchemaFixesTheActionSet() throws {

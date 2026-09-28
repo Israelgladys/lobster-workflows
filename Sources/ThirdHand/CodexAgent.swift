@@ -15,6 +15,8 @@ struct PlannerTier: Equatable {
     let effort: String
 
     nonisolated static let strong = PlannerTier(model: CodexClient.strongModel, effort: "low")
+    /// Used when routing is slow or fails; a failed plan still escalates to `strong`.
+    nonisolated static let quick = PlannerTier(model: CodexClient.strongModel, effort: "none")
 }
 
 enum AgentOutcome: Equatable {
@@ -43,6 +45,7 @@ final class CodexAgent {
     nonisolated static let maxTurns = 15
     nonisolated static let maxStepsPerPlan = 12
     nonisolated static let maxScreenCharacters = 20_000
+    nonisolated static let maxContextLines = 40
 
     private let planner: Planner
     private var tier: PlannerTier
@@ -117,22 +120,32 @@ final class CodexAgent {
                         "properties": ["reason": ["type": "string"]]] as [String: Any]]
     ]
 
+    /// The planner sees every labelled control it can act on, plus focused and outcome evidence and a bounded
+    /// amount of other text. Unlabelled elements (which it couldn't name) and exact duplicates are dropped.
     nonisolated static func describe(_ elements: [AccessibilityElement]) -> String {
+        let actionable = Set(JevClient.targets(elements).values.flatMap(\.keys))
         var lines: [String] = []
+        var seen: Set<String> = []
         var used = 0
+        var context = 0
+        var omitted = 0
         for element in elements {
+            guard element.label?.isEmpty == false || element.value?.isEmpty == false else { continue }
+            if !actionable.contains(String(element.id)) && !element.focused && !element.isOutcomeEvidence {
+                guard context < maxContextLines else { omitted += 1; continue }
+                context += 1
+            }
             var line = "- \(element.displayRole) \"\(element.displayLabel.prefix(200))\""
             if let value = element.value, !value.isEmpty, value != element.label { line += " = \"\(value.prefix(300))\"" }
             if element.focused { line += " [focused]" }
             if !element.enabled { line += " [disabled]" }
             if element.source == "ocr" { line += " (ocr text)" }
-            guard used + line.count <= maxScreenCharacters else {
-                lines.append("- … \(elements.count - lines.count) more elements omitted")
-                break
-            }
+            guard seen.insert(line).inserted else { continue }
+            guard used + line.count <= maxScreenCharacters else { omitted += elements.count - lines.count; break }
             used += line.count + 1
             lines.append(line)
         }
+        if omitted > 0 { lines.append("- … \(omitted) more non-interactive elements omitted") }
         return lines.isEmpty ? "(no controls exposed)" : lines.joined(separator: "\n")
     }
 
