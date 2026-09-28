@@ -217,15 +217,16 @@ private final class ScriptedPlanner: Planner {
 @MainActor
 private final class RecordingLayer: ActionLayer {
     var steps: [(String, String?)] = []
-    var status = "verified"
+    /// Status per performed step; defaults to verified.
+    var statuses: [String] = []
     func currentElements() async throws -> [AccessibilityElement] {
         [AccessibilityElement(id: 1, role: "AXTextField", label: "Search", value: nil, enabled: true, actions: [], axElement: nil)]
     }
     func perform(instruction: String, text: String?) async throws -> StepOutcome {
         steps.append((instruction, text))
-        let value = text ?? "screen \(steps.count)"
+        let status = statuses.isEmpty ? "verified" : statuses.removeFirst()
         return StepOutcome(status: status, detail: "ok", elements: [
-            AccessibilityElement(id: 1, role: "AXTextField", label: "Search", value: value, enabled: true, actions: [], axElement: nil)
+            AccessibilityElement(id: 1, role: "AXTextField", label: "Search", value: "screen \(steps.count)", enabled: true, actions: [], axElement: nil)
         ])
     }
 }
@@ -235,26 +236,54 @@ private func call(_ id: String, _ name: String, _ args: [String: Any?]) -> [Stri
     return ["type": "function_call", "call_id": id, "name": name, "arguments": arguments]
 }
 
+private func act(_ id: String, _ steps: [(String, String?)], summary: String?) -> [String: Any] {
+    call(id, "act", ["steps": steps.map { ["instruction": $0.0, "text": $0.1 as Any? ?? NSNull()] }, "summary": summary])
+}
+
 @MainActor
 final class CodexAgentTests: XCTestCase {
-    func testPlannerTextIsTypedVerbatimAndDoneFinishes() async throws {
-        let planner = ScriptedPlanner([
-            [call("c1", "step", ["instruction": "Type in the Search field", "text": "Adele — Skyfall (2012)"])],
-            [call("c2", "step", ["instruction": "Press Return", "text": nil])],
-            [call("c3", "done", ["summary": "Searched for Skyfall."])]
-        ])
+    func testWholeTaskRunsFromOnePlannerTurn() async throws {
+        let planner = ScriptedPlanner([[act("c1", [("Click the Search field", nil),
+                                                   ("Type into the search field", "Adele — Skyfall (2012)"),
+                                                   ("Press Return", nil)], summary: "Searched for Skyfall.")]])
         let layer = RecordingLayer()
-        let outcome = try await CodexAgent(planner: planner).run(goal: "play skyfall", appName: "Music", layer: layer)
+        let outcome = try await CodexAgent(planner: planner).run(goal: "search skyfall", appName: "Spotify", layer: layer)
         XCTAssertEqual(outcome, .done("Searched for Skyfall."))
-        XCTAssertEqual(layer.steps.map(\.0), ["Type in the Search field", "Press Return"])
-        XCTAssertEqual(layer.steps[0].1, "Adele — Skyfall (2012)")
-        XCTAssertNil(layer.steps[1].1)
+        XCTAssertEqual(planner.inputs.count, 1)
+        XCTAssertEqual(layer.steps.map(\.0), ["Click the Search field", "Type into the search field", "Press Return"])
+        XCTAssertEqual(layer.steps[1].1, "Adele — Skyfall (2012)", "Planner text is typed verbatim")
+        XCTAssertNil(layer.steps[2].1)
     }
 
-    func testOnlyNewestScreenIsSentInFull() async throws {
+    func testFailedStepStopsPlanAndReturnsScreenToPlanner() async throws {
         let planner = ScriptedPlanner([
-            [call("c1", "step", ["instruction": "Click Search", "text": nil])],
-            [call("c2", "step", ["instruction": "Click Search again", "text": nil])],
+            [act("c1", [("Click Search", nil), ("Type query", "adele"), ("Press Return", nil)], summary: "Searched.")],
+            [call("c2", "fail", ["reason": "No search field."])]
+        ])
+        let layer = RecordingLayer()
+        layer.statuses = ["verified", "blocked"]
+        let outcome = try await CodexAgent(planner: planner).run(goal: "g", appName: "App", layer: layer)
+        XCTAssertEqual(outcome, .failed("No search field."))
+        XCTAssertEqual(layer.steps.count, 2, "Steps after a failure are not run")
+        let output = try XCTUnwrap(planner.inputs[1].last?["output"] as? String)
+        let result = try JSONSerialization.jsonObject(with: Data(output.utf8)) as! [String: Any]
+        XCTAssertEqual(result["completed_all_steps"] as? Bool, false)
+        XCTAssertTrue((result["screen"] as? String)?.contains("screen 2") == true)
+        XCTAssertTrue(output.contains("not_run"))
+    }
+
+    func testTerminalInputSentCountsAsProgress() async throws {
+        let planner = ScriptedPlanner([[act("c1", [("Type the command", "ls -la"), ("Press Return", nil)], summary: "Listed files.")]])
+        let layer = RecordingLayer()
+        layer.statuses = ["sent", "verified"]
+        let outcome = try await CodexAgent(planner: planner).run(goal: "list files", appName: "Terminal", layer: layer)
+        XCTAssertEqual(outcome, .done("Listed files."))
+    }
+
+    func testNullSummaryReturnsScreenAndOnlyNewestScreenIsFull() async throws {
+        let planner = ScriptedPlanner([
+            [act("c1", [("Click Search", nil)], summary: nil)],
+            [act("c2", [("Click Search again", nil)], summary: nil)],
             [call("c3", "done", ["summary": "ok"])]
         ])
         _ = try await CodexAgent(planner: planner).run(goal: "g", appName: "App", layer: RecordingLayer())
@@ -269,13 +298,13 @@ final class CodexAgentTests: XCTestCase {
 
     func testEveryExtraCallGetsAnOutputAndIsNotExecuted() async throws {
         let planner = ScriptedPlanner([
-            [call("c1", "step", ["instruction": "Click A", "text": nil]), call("c2", "step", ["instruction": "Click B", "text": nil])],
+            [act("c1", [("Click A", nil)], summary: nil), act("c2", [("Click B", nil)], summary: nil)],
             [call("c3", "fail", ["reason": "Needs sign-in."])]
         ])
         let layer = RecordingLayer()
         let outcome = try await CodexAgent(planner: planner).run(goal: "g", appName: "App", layer: layer)
         XCTAssertEqual(outcome, .failed("Needs sign-in."))
-        XCTAssertEqual(layer.steps.count, 1)
+        XCTAssertEqual(layer.steps.map(\.0), ["Click A"])
         let outputs = planner.inputs[1].filter { $0["type"] as? String == "function_call_output" }.map { $0["call_id"] as? String }
         XCTAssertEqual(outputs, ["c1", "c2"])
     }
@@ -290,22 +319,22 @@ final class CodexAgentTests: XCTestCase {
         XCTAssertTrue(layer.steps.isEmpty)
     }
 
-    func testInvalidStepArgumentsAreRejectedWithoutInput() async throws {
+    func testInvalidPlanIsRejectedBeforeAnyInput() async throws {
         let planner = ScriptedPlanner([
-            [call("c1", "step", ["instruction": "  ", "text": nil])],
+            [act("c1", [("Click A", nil), ("  ", nil)], summary: "x")],
             [call("c2", "done", ["summary": "ok"])]
         ])
         let layer = RecordingLayer()
         _ = try await CodexAgent(planner: planner).run(goal: "g", appName: "App", layer: layer)
-        XCTAssertTrue(layer.steps.isEmpty)
+        XCTAssertTrue(layer.steps.isEmpty, "A plan with any invalid step sends no input")
         let output = planner.inputs[1].last?["output"] as? String
         XCTAssertTrue(output?.contains("rejected") == true)
     }
 
-    func testStepToolRequiresExplicitNullableText() throws {
-        let step = CodexAgent.tools.first { $0["name"] as? String == "step" }!
-        let parameters = step["parameters"] as! [String: Any]
-        XCTAssertEqual(parameters["required"] as? [String], ["instruction", "text"])
-        XCTAssertEqual(step["strict"] as? Bool, true)
+    func testActToolRequiresStepsAndNullableSummary() throws {
+        let act = CodexAgent.tools.first { $0["name"] as? String == "act" }!
+        let parameters = act["parameters"] as! [String: Any]
+        XCTAssertEqual(parameters["required"] as? [String], ["steps", "summary"])
+        XCTAssertEqual(act["strict"] as? Bool, true)
     }
 }

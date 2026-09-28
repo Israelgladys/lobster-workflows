@@ -140,7 +140,9 @@ final class TaskRunner: ActionLayer {
                 phase = "selecting_action"
                 let result = try await jev.decide(goal: stepGoal, elements: observation.elements, appName: target.name, history: history)
                 Log.info("Decision operation=\(result.decision.operation) done=\(result.done) absent=\(result.absent)")
-                decision = result.done >= JevClient.doneThreshold ? AgentDecision(operation: "DONE") : result.decision
+                // A text step is only already satisfied when some field visibly holds that text.
+                let textPresent = text.map { text in observation.elements.contains { $0.value == text } } ?? true
+                decision = result.done >= JevClient.doneThreshold && textPresent ? AgentDecision(operation: "DONE") : result.decision
             } catch is CancellationError { throw CancellationError() }
             catch let error as JevServiceError { throw error }
             catch {
@@ -160,6 +162,15 @@ final class TaskRunner: ActionLayer {
                 if enableOCR(reason) { continue }
                 let permission = useOCR || CGPreflightScreenCaptureAccess() ? "" : " Enable Screen Recording for Third Hand to read unlabeled screen text."
                 return StepOutcome(status: "blocked", detail: reason + permission + " Try a different step, such as scrolling or opening a menu.", elements: latest)
+            }
+            // A step with text must type it: a click on an editable field becomes entry into that field,
+            // and anything else is rejected rather than silently dropping the text.
+            if let text, decision.operation != "TYPE_TEXT" {
+                guard ["CLICK", "DOUBLE_CLICK"].contains(decision.operation), let targetID = decision.targetIndex,
+                      JevClient.targets(observation.elements)["TYPE_TEXT"]?[targetID] != nil else {
+                    return StepOutcome(status: "rejected", detail: "This step has text to enter, but no editable field was found for it (the selector chose \(decision.operation)). Name the field to type into.", elements: latest)
+                }
+                decision = AgentDecision(operation: "TYPE_TEXT", targetIndex: targetID, textValue: text)
             }
             if decision.operation == "TYPE_TEXT" {
                 guard let text else {
@@ -233,7 +244,8 @@ final class TaskRunner: ActionLayer {
             let described = describe(decision, elements: observation.elements)
             history.append(ActionHistory(action: described, result: verification.detail))
             Log.info("Action step=\(actions) operation=\(decision.operation) verified=\(verification.verified) ocr=\(useOCR)")
-            return StepOutcome(status: verification.verified ? "verified" : "unverified",
+            let sent = target.isTerminal && decision.operation == "TYPE_TEXT" && executionError == nil
+            return StepOutcome(status: verification.verified ? "verified" : sent ? "sent" : "unverified",
                                detail: "\(described): \(verification.detail)", elements: after.elements)
         }
         return StepOutcome(status: "blocked", detail: "The app kept changing before this step could be performed safely.", elements: latest)
