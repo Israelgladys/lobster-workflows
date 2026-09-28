@@ -11,6 +11,10 @@ struct AppTarget {
     let windowFrame: NSRect?
     let icon: NSImage?
 
+    var isTerminal: Bool {
+        ["com.apple.Terminal", "com.googlecode.iterm2", "com.mitchellh.ghostty", "dev.warp.Warp-Stable", "net.kovidgoyal.kitty", "org.alacritty"].contains(bundleIdentifier ?? "")
+    }
+
     static func captureCurrentApp() -> AppTarget? {
         guard let frontApp = NSWorkspace.shared.frontmostApplication else {
             Log.info("captureCurrentApp: no frontmost app")

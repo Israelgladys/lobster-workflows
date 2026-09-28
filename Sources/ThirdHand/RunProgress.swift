@@ -89,6 +89,9 @@ struct RunProgress {
         return nil
     }
 
+    /// The planner was told about the failures and will choose a different step.
+    mutating func acknowledgeFailures() { failures = 0 }
+
     mutating func beginRecovery() -> Bool {
         guard !usedRecovery else { return false }
         usedRecovery = true

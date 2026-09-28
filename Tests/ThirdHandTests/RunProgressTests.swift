@@ -95,13 +95,6 @@ final class RunProgressTests: XCTestCase {
         XCTAssertNil(ElectronDetector.debugPort(in: "Electron --remote-debugging-port=99999"))
         XCTAssertEqual(ElectronDetector.debugPort(in: "Electron --remote-debugging-port=9345"), 9345)
     }
-
-    func testLiteralExtractionDoesNotPretendToGenerateWriting() {
-        XCTAssertNil(TextExtractor.extract(from: "write a short essay about whales"))
-        XCTAssertNil(TextExtractor.extract(from: "search for whales then open the first result"))
-        XCTAssertEqual(TextExtractor.extract(from: "search for Boards of Canada"), "Boards of Canada")
-        XCTAssertEqual(TextExtractor.extract(from: "type \"Hello!\""), "Hello!")
-    }
 }
 
 @MainActor

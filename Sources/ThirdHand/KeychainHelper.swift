@@ -3,14 +3,16 @@ import Security
 
 enum KeychainHelper {
     private static let legacyPath = NSHomeDirectory() + "/.thirdhand-api-key"
-    private static let query: [String: Any] = [
-        kSecClass as String: kSecClassGenericPassword,
-        kSecAttrService as String: "com.thirdhand.openrouter",
-        kSecAttrAccount as String: "api-key"
-    ]
+    private static let apiKeyItem = item(service: "com.thirdhand.openrouter", account: "api-key")
+    private static let codexItem = item(service: "com.thirdhand.codex", account: "chatgpt-oauth")
 
-    static func saveAPIKey(_ key: String) throws {
-        let data = Data(key.utf8)
+    private static func item(service: String, account: String) -> [String: Any] {
+        [kSecClass as String: kSecClassGenericPassword,
+         kSecAttrService as String: service,
+         kSecAttrAccount as String: account]
+    }
+
+    private static func save(_ data: Data, to query: [String: Any]) throws {
         var status = SecItemUpdate(query as CFDictionary, [kSecValueData as String: data] as CFDictionary)
         if status == errSecItemNotFound {
             var item = query
@@ -21,16 +23,25 @@ enum KeychainHelper {
         guard status == errSecSuccess else {
             throw ControllerError.invalid("Keychain error \(status): \(SecCopyErrorMessageString(status, nil) as String? ?? "Unknown error")")
         }
-        try? FileManager.default.removeItem(atPath: legacyPath)
     }
 
-    static func getAPIKey() -> String? {
+    private static func load(_ query: [String: Any]) -> (OSStatus, Data?) {
         var lookup = query
         lookup[kSecReturnData as String] = true
         lookup[kSecMatchLimit as String] = kSecMatchLimitOne
         var result: CFTypeRef?
         let status = SecItemCopyMatching(lookup as CFDictionary, &result)
-        if status == errSecSuccess, let data = result as? Data {
+        return (status, result as? Data)
+    }
+
+    static func saveAPIKey(_ key: String) throws {
+        try save(Data(key.utf8), to: apiKeyItem)
+        try? FileManager.default.removeItem(atPath: legacyPath)
+    }
+
+    static func getAPIKey() -> String? {
+        let (status, data) = load(apiKeyItem)
+        if status == errSecSuccess, let data {
             return String(data: data, encoding: .utf8)
         }
         guard status == errSecItemNotFound,
@@ -41,9 +52,22 @@ enum KeychainHelper {
         catch { return nil }
     }
 
-
     static func delete() {
-        SecItemDelete(query as CFDictionary)
+        SecItemDelete(apiKeyItem as CFDictionary)
         try? FileManager.default.removeItem(atPath: legacyPath)
+    }
+
+    static func saveCodexTokens(_ tokens: CodexTokens) throws {
+        try save(try JSONEncoder().encode(tokens), to: codexItem)
+    }
+
+    static func getCodexTokens() -> CodexTokens? {
+        let (status, data) = load(codexItem)
+        guard status == errSecSuccess, let data else { return nil }
+        return try? JSONDecoder().decode(CodexTokens.self, from: data)
+    }
+
+    static func deleteCodexTokens() {
+        SecItemDelete(codexItem as CFDictionary)
     }
 }

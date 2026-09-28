@@ -1,12 +1,14 @@
 # Third Hand
 
+> Third Hand was a proof of concept to show that we can use Jev for computer use, but now we are building a full-fledged assistant.
+
 A small macOS menu bar assistant. Focus an app, press **Control–Space**, and tell it what to do.
 
 Third Hand reads accessible controls, types, clicks, and checks the result. Press **Control–Space** again or click **×** to stop.
 
 ## Download
 
-[Download the latest release](https://github.com/shhivv/third-hand/releases/latest) for Apple Silicon Macs running macOS 14 or newer. Unzip the archive, move **Third Hand.app** to Applications, and open it. Release builds are Developer ID-signed and notarized by Apple. A TypeSafe API key is required.
+[Download the latest release](https://github.com/shhivv/third-hand/releases/latest) for Apple Silicon Macs running macOS 14 or newer. Unzip the archive, move **Third Hand.app** to Applications, and open it. Release builds are Developer ID-signed and notarized by Apple. A ChatGPT account with Codex access and a TypeSafe API key are required.
 
 ## Build from source
 
@@ -24,17 +26,19 @@ In the setup window:
 1. Enable **Accessibility** so Third Hand can read and control apps.
 2. Enable **Screen Recording** for local text recognition when an app’s controls aren’t accessible.
 3. Add your **TypeSafe API key**. It’s saved in macOS Keychain.
+4. Click **Sign in with ChatGPT** and finish signing in in your browser. Tokens are saved in macOS Keychain.
 
 Switch to an app, press **Control–Space**, and try a specific task, such as “Search for Adele.”
 
-The app runs on macOS 14+. Jev is the only model; Apple Intelligence is not required.
+The app runs on macOS 14+. Apple Intelligence is not required.
 
 ## How it works
 
 - **Accessibility** reads controls and their current values.
 - **Apple Vision** reads screen text locally when needed. Screenshots aren’t uploaded.
-- **Jev** chooses actions from text descriptions. Your request, app name, screen labels and values, and recent action history are sent to TypeSafe. Third Hand is **not fully offline**.
-- **Structured text entry** lets Jev select search phrases or literal text from your current request. Free-form writing and arbitrary command generation are not supported.
+- **ChatGPT (Codex)** plans the task one step at a time and writes any text to enter: search terms, messages, commands. Your request, app name, screen labels and values, and step results are sent to OpenAI through your ChatGPT account. The model defaults to `gpt-6-sol`; override it with `defaults write com.thirdhand.app CodexModel <model>`.
+- **Jev** grounds each step to a control on screen and Third Hand executes and verifies it. The step, app name, screen labels and values, and recent action history are sent to TypeSafe.
+- Third Hand is **not offline**.
 
 No bundled model weights or extra runtime dependencies. Third Hand never restarts the apps it controls.
 
@@ -51,7 +55,7 @@ Setup shows current permission status. If macOS asks you to quit and reopen afte
 
 Diagnostic logs are written to `~/Desktop/thirdhand.log`. They include action status, timing, and bounded API rejection messages. Review logs before sharing: service error messages can contain request details. API keys are redacted from those messages.
 
-For terminal entry, focus a shell prompt and provide the exact command, such as `type "ls -la"`. Third Hand preserves the supplied command and submits only when Jev selects Return. It does not construct commands from navigation requests or append verification commands. It will not retype a terminal command automatically. Interactive editors and non-shell terminal programs are not supported by this entry mode.
+In terminals, the planner can write and run shell commands. Third Hand types each command once and won't enter another until the pending one is submitted. Stay nearby: commands run with your user's permissions.
 
 ## Status
 

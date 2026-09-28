@@ -10,10 +10,11 @@ protocol TaskRunnerDelegate: AnyObject {
 }
 
 @MainActor
-final class TaskRunner {
+final class TaskRunner: ActionLayer {
     let target: AppTarget
     let goal: String
     let apiKey: String
+    let credentials: CodexCredentials
     weak var delegate: TaskRunnerDelegate?
     private var task: Task<Void, Never>?
     private var history: [ActionHistory] = []
@@ -23,12 +24,15 @@ final class TaskRunner {
     private var useOCR = false
     private var progress = RunProgress()
     private var phase = "starting"
-    private var terminalEntrySent = false
+    private var terminalInputPending = false
+    private var actions = 0
+    private lazy var jev = JevClient(apiKey: apiKey)
 
-    init(target: AppTarget, goal: String, apiKey: String) {
+    init(target: AppTarget, goal: String, apiKey: String, credentials: CodexCredentials) {
         self.target = target
         self.goal = goal
         self.apiKey = apiKey
+        self.credentials = credentials
     }
 
     func start() {
@@ -57,10 +61,10 @@ final class TaskRunner {
     private func run() async {
         defer { active = false; cdpClient?.disconnect(); cdpClient = nil }
         do {
-            try await AsyncTimeout.run(seconds: 180, message: "Stopped after three minutes. The task has not been verified complete.", onTimeout: {
+            try await AsyncTimeout.run(seconds: 300, message: "Stopped after five minutes. The task has not been verified complete.", onTimeout: {
                 self.active = false
                 self.cdpClient?.disconnect()
-            }) { try await self.runLoop() }
+            }) { try await self.runAgent() }
         } catch is CancellationError {
         } catch {
             guard !Task.isCancelled else { return }
@@ -70,7 +74,7 @@ final class TaskRunner {
         }
     }
 
-    private func runLoop() async throws {
+    private func runAgent() async throws {
         guard AXIsProcessTrusted() else { throw ControllerError.invalid("Enable Accessibility for Third Hand in System Settings.") }
         target.application.activate()
         try await Task.sleep(nanoseconds: 400_000_000)
@@ -85,35 +89,63 @@ final class TaskRunner {
         try checkFocus()
         AXUIElementSetAttributeValue(target.appElement, "AXManualAccessibility" as CFString, kCFBooleanTrue)
         AXUIElementSetAttributeValue(target.appElement, "AXEnhancedUserInterface" as CFString, kCFBooleanTrue)
-        let jev = JevClient(apiKey: apiKey)
-        var actions = 0
+        phase = "planning"
+        let agent = CodexAgent(planner: CodexClient(credentials: credentials))
+        let outcome = try await agent.run(goal: goal, appName: target.name, layer: self) { [weak self] status in
+            guard let self else { return }
+            self.delegate?.taskRunner(self, status: status)
+        }
+        try checkFocus()
+        switch outcome {
+        case .done(let summary):
+            Log.info("Task completed actions=\(actions) summary_chars=\(summary.count)")
+            delegate?.taskRunnerDone(self)
+        case .failed(let reason):
+            Log.info("Task stopped by planner actions=\(actions)")
+            delegate?.taskRunnerFailed(self, error: reason)
+        }
+    }
 
-        // Separate observation budget permits a final verification after the last action,
-        // while bounding stale-window retries and recovery iterations too.
-        for _ in 0..<40 {
+    // MARK: - Action layer
+
+    func currentElements() async throws -> [AccessibilityElement] {
+        var observation = try await observe()
+        if !useOCR && JevClient.targets(observation.elements).isEmpty, enableOCR("No usable controls were exposed by the app.") {
+            observation = try await observe()
+        }
+        return observation.elements
+    }
+
+    /// One planner step: Jev grounds the instruction to a control; the planner's text is typed verbatim.
+    func perform(instruction: String, text: String?) async throws -> StepOutcome {
+        guard actions < maxSteps else {
+            throw ControllerError.invalid("Stopped after \(maxSteps) actions. The final screen does not confirm completion.")
+        }
+        // Jev's done/absent questions are scoped to the step, not the whole task.
+        let stepGoal = text.map { "\(instruction) (text to enter: \"\($0.prefix(200))\")" } ?? instruction
+        var latest: [AccessibilityElement] = []
+        // Separate observation budget bounds stale-window retries and recovery within a step.
+        for _ in 0..<4 {
             try checkFocus()
-            delegate?.taskRunner(self, status: "Observing… (\(actions)/\(maxSteps))")
+            delegate?.taskRunner(self, status: "Finding the control… (\(actions)/\(maxSteps))")
             phase = "observing"
             var observation = try await observe()
-            if !useOCR && JevClient.targets(observation.elements).isEmpty {
-                try recover("No usable controls were exposed by the app.")
+            if !useOCR && JevClient.targets(observation.elements).isEmpty, enableOCR("No usable controls were exposed by the app.") {
                 observation = try await observe()
             }
+            latest = observation.elements
             try checkFocus()
-            delegate?.taskRunner(self, status: actions == maxSteps ? "Checking the result…" : "Thinking… (\(actions)/\(maxSteps))")
             var decision: AgentDecision
             do {
                 phase = "selecting_action"
-                let result = try await jev.decide(goal: goal, elements: observation.elements, appName: target.name, history: history)
+                let result = try await jev.decide(goal: stepGoal, elements: observation.elements, appName: target.name, history: history)
                 Log.info("Decision operation=\(result.decision.operation) done=\(result.done) absent=\(result.absent)")
-                decision = result.done >= JevClient.doneThreshold
-                    ? AgentDecision(operation: "DONE") : result.decision
+                decision = result.done >= JevClient.doneThreshold ? AgentDecision(operation: "DONE") : result.decision
             } catch is CancellationError { throw CancellationError() }
             catch let error as JevServiceError { throw error }
             catch {
                 try checkFocus()
-                try recover("Action selection failed: \(error.localizedDescription)")
-                continue
+                return StepOutcome(status: "blocked", detail: "The action selector failed: \(error.localizedDescription)", elements: latest)
             }
             try checkFocus()
             guard isCurrent(observation) else {
@@ -121,50 +153,34 @@ final class TaskRunner {
                 continue
             }
             if decision.operation == "DONE" {
-                // Re-observe independently: neither input sent nor a confidence score alone is completion.
-                let fresh = try await observe()
-                try checkFocus()
-                phase = "confirming_completion"
-                let confirmed = try await jev.confirmCompletion(goal: goal, elements: fresh.elements,
-                                                               appName: target.name, history: history)
-                try checkFocus()
-                guard isCurrent(fresh) else {
-                    throw ControllerError.invalid("The window changed during completion checking. Stopped without sending more input.")
-                }
-                if confirmed { Log.info("Task completed verified=true"); delegate?.taskRunnerDone(self); return }
-                // Completion is plausible; further clicks could undo the result (e.g. pause playback).
-                Log.info("Task completed verified=false (inconclusive)"); delegate?.taskRunnerDone(self); return
-            }
-            guard actions < maxSteps else {
-                throw ControllerError.invalid("Stopped after \(maxSteps) actions. The final screen does not confirm completion.")
+                return StepOutcome(status: "step_complete", detail: "The action selector judged this step already satisfied on screen; no input was sent.", elements: latest)
             }
             if decision.operation == "BLOCKED" {
-                try recover(decision.reason ?? "The next control is not visible.")
-                continue
+                let reason = decision.reason ?? "The control for this step is not visible."
+                if enableOCR(reason) { continue }
+                let permission = useOCR || CGPreflightScreenCaptureAccess() ? "" : " Enable Screen Recording for Third Hand to read unlabeled screen text."
+                return StepOutcome(status: "blocked", detail: reason + permission + " Try a different step, such as scrolling or opening a menu.", elements: latest)
             }
-            if decision.operation == "TYPE_TEXT", decision.textValue == nil {
-                guard let field = observation.elements.first(where: { String($0.id) == decision.targetIndex }) else {
-                    throw ControllerError.invalid("No editable field was selected.")
+            if decision.operation == "TYPE_TEXT" {
+                guard let text else {
+                    return StepOutcome(status: "needs_text", detail: "This step targets an editable field. Call step again with the exact text to enter.", elements: latest)
                 }
-                guard !terminalEntrySent else {
-                    throw ControllerError.invalid("Terminal input was already sent. Stopped rather than entering the command again without a verified result.")
+                guard !(target.isTerminal && terminalInputPending) else {
+                    return StepOutcome(status: "rejected", detail: "Terminal input was already entered and not submitted. Press Return to run it, or clear the line first.", elements: latest)
                 }
-                delegate?.taskRunner(self, status: "Choosing text…")
-                phase = "selecting_text"
-                let plan = try await jev.selectText(goal: goal, field: field, appName: target.name,
-                                                   terminal: TextEntryPlan.isTerminal(target.bundleIdentifier))
-                decision.textValue = plan.text
-                Log.info("Text entry intent=\(plan.kind)")
+                decision.textValue = text
             }
             phase = "validating_action"
-            try decision.validate(elements: observation.elements, hasScreenshot: false)
+            do { try decision.validate(elements: observation.elements, hasScreenshot: false) }
+            catch { return StepOutcome(status: "rejected", detail: error.localizedDescription, elements: latest) }
             try checkFocus()
             guard isCurrent(observation) else { continue }
-            // Revalidate the chosen control after model/text latency, even if the window stayed still.
+            // Revalidate the chosen control after model latency, even if the window stayed still.
             if let targetID = decision.targetIndex,
                let original = observation.elements.first(where: { String($0.id) == targetID }) {
                 phase = "revalidating_target"
                 let fresh = try await observe()
+                latest = fresh.elements
                 guard fresh.windowID == observation.windowID, fresh.frame == observation.frame,
                       let current = ObservationState.matching(original, in: fresh.elements), current.enabled,
                       current.frame == original.frame else {
@@ -176,19 +192,18 @@ final class TaskRunner {
             }
             try checkFocus()
             guard isCurrent(observation) else { continue }
-            try decision.validate(elements: observation.elements, hasScreenshot: false)
-            if decision.operation == "TYPE_TEXT", !TextEntryPlan.isTerminal(target.bundleIdentifier),
+            do { try decision.validate(elements: observation.elements, hasScreenshot: false) }
+            catch { return StepOutcome(status: "rejected", detail: error.localizedDescription, elements: latest) }
+            if decision.operation == "TYPE_TEXT", !target.isTerminal,
                let field = observation.elements.first(where: { String($0.id) == decision.targetIndex }),
                field.value == decision.textValue {
-                history.append(ActionHistory(action: "SKIP_TYPE", result: "The selected field already contains the requested text. Submit it or choose a different action; do not retype it."))
-                if history.suffix(3).allSatisfy({ $0.action == "SKIP_TYPE" }), history.count >= 3 {
-                    throw ControllerError.invalid("The field already contains the requested text, but no next step was selected.")
-                }
-                continue
+                history.append(ActionHistory(action: "SKIP_TYPE", result: "The selected field already contains the requested text."))
+                return StepOutcome(status: "step_complete", detail: "The field already contains this text; no input was sent. Submit it or choose a different action.", elements: latest)
             }
             if let problem = progress.problem(decision: decision, elements: observation.elements) {
-                try recover(problem)
-                continue
+                // Let the planner change strategy; repeated-action blocking still applies to its next step.
+                progress.acknowledgeFailures()
+                return StepOutcome(status: "rejected", detail: problem, elements: latest)
             }
             delegate?.taskRunner(self, status: "\(decision.operation == "TYPE_TEXT" ? "Entering text" : "Working")… (\(actions + 1)/\(maxSteps))")
             actions += 1
@@ -210,33 +225,34 @@ final class TaskRunner {
             if let executionError {
                 verification = ActionVerification(verified: false, detail: "Execution failed: \(executionError)")
             }
-            try checkFocus()
             if !isCurrent(after) { verification = ActionVerification(verified: false, detail: "Window changed during verification; result is unverified.") }
-            if TextEntryPlan.isTerminal(target.bundleIdentifier), decision.operation == "TYPE_TEXT", executionError == nil {
-                verification = ActionVerification(verified: false, detail: "Terminal input sent once, awaiting submission and command output. Do not retype. Select Return to submit if appropriate, then verify the result.")
+            if target.isTerminal, decision.operation == "TYPE_TEXT", executionError == nil {
+                verification = ActionVerification(verified: false, detail: "Terminal input sent once and not yet submitted. Press Return to run it; do not retype it.")
             }
             progress.record(verification)
-            history.append(ActionHistory(action: describe(decision, elements: observation.elements), result: verification.detail))
+            let described = describe(decision, elements: observation.elements)
+            history.append(ActionHistory(action: described, result: verification.detail))
             Log.info("Action step=\(actions) operation=\(decision.operation) verified=\(verification.verified) ocr=\(useOCR)")
+            return StepOutcome(status: verification.verified ? "verified" : "unverified",
+                               detail: "\(described): \(verification.detail)", elements: after.elements)
         }
-        throw ControllerError.invalid("Stopped because the app kept changing before actions could be verified.")
+        return StepOutcome(status: "blocked", detail: "The app kept changing before this step could be performed safely.", elements: latest)
     }
 
-    private func recover(_ reason: String) throws {
+    /// Adds on-device OCR once per task. Returns false when already used or not permitted.
+    private func enableOCR(_ reason: String) -> Bool {
         phase = "recovery"
-        Log.info("Task recovery already_used=\(useOCR)")
-        try checkFocus()
-        guard progress.beginRecovery(), !useOCR else {
-            Log.info("Task completed verified=false (recovery exhausted)"); delegate?.taskRunnerDone(self); return
+        guard !useOCR, CGPreflightScreenCaptureAccess(), progress.beginRecovery() else {
+            Log.info("OCR recovery unavailable already_used=\(useOCR)")
+            return false
         }
-        guard CGPreflightScreenCaptureAccess() else {
-            throw ControllerError.invalid("Stopped: \(reason) Enable Screen Recording for Third Hand, then relaunch, to read missing screen labels locally.")
-        }
+        Log.info("OCR recovery enabled")
         cdpClient?.disconnect()
         cdpClient = nil
         useOCR = true
-        history.append(ActionHistory(action: "RECOVER", result: reason + " Added on-device OCR text from the current window. OCR regions are text, not proven controls. Choose a different strategy."))
+        history.append(ActionHistory(action: "RECOVER", result: reason + " Added on-device OCR text from the current window. OCR regions are text, not proven controls."))
         delegate?.taskRunner(self, status: "Reading screen text locally…")
+        return true
     }
 
     private struct Observation {
@@ -352,7 +368,7 @@ final class TaskRunner {
                 try click()
             })
             try checkFocus()
-            if TextEntryPlan.isTerminal(target.bundleIdentifier) {
+            if target.isTerminal {
                 // Readline-style editing for a shell prompt; Command-A selects scrollback.
                 try InputController.press("a", modifiers: ["control"])
                 try InputController.press("k", modifiers: ["control"])
@@ -369,9 +385,11 @@ final class TaskRunner {
             phase = "typing_text"
             Log.info("Text entry stage=typing")
             try await InputController.type(text, check: checkTypingFocus)
-            if TextEntryPlan.isTerminal(target.bundleIdentifier) { terminalEntrySent = true }
+            if target.isTerminal { terminalInputPending = true }
             Log.info("Text entry stage=input_sent")
-        case "KEY_PRESS": try InputController.press(decision.key!, modifiers: decision.modifiers ?? [])
+        case "KEY_PRESS":
+            try InputController.press(decision.key!, modifiers: decision.modifiers ?? [])
+            terminalInputPending = false
         case "SCROLL_UP", "SCROLL_DOWN":
             guard let frame = windowFrame else { throw ControllerError.invalid("No window to scroll") }
             try InputController.scroll(decision.operation == "SCROLL_UP" ? 5 : -5,

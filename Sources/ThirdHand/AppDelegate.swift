@@ -13,10 +13,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, TaskRunnerDelegate, Ob
     private var setupWindow: NSWindow?
     private var permissionTimer: Timer?
     private var apiKey: String?
+    private var codexCredentials: CodexCredentials?
     @Published var accessibilityReady = false
     @Published var shortcutReady = false
     @Published var screenReady = false
     @Published var keyReady = false
+    @Published var codexAccount: String?
+    @Published var codexSigningIn = false
+    var codexReady: Bool { codexAccount != nil }
 
     func applicationWillFinishLaunching(_ notification: Notification) {
         Log.info("applicationWillFinishLaunching")
@@ -40,6 +44,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, TaskRunnerDelegate, Ob
             guard let self else { return }
             self.apiKey = KeychainHelper.getAPIKey()
             self.keyReady = self.apiKey != nil
+            if let tokens = KeychainHelper.getCodexTokens() { self.useCodex(tokens) }
         }
 
         Log.info("setup done")
@@ -52,7 +57,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, TaskRunnerDelegate, Ob
 
     func showSetup() {
         if setupWindow == nil {
-            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 540, height: 470),
+            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 540, height: 520),
                                   styleMask: [.titled, .closable], backing: .buffered, defer: false)
             window.title = "Third Hand"
             window.isReleasedWhenClosed = false
@@ -91,6 +96,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, TaskRunnerDelegate, Ob
         if taskRunner != nil { taskRunner?.cancel(); statusWindow?.dismiss(); taskRunner = nil; return }
 
         guard apiKey != nil else { Log.info("No API key"); promptAPIKey(); return }
+        guard codexCredentials != nil else { Log.info("No ChatGPT sign-in"); showSetup(); return }
         guard let target = AppTarget.captureCurrentApp() else { Log.info("No target app"); return }
 
         currentTarget = target
@@ -128,9 +134,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, TaskRunnerDelegate, Ob
     // MARK: - Task execution
 
     private func startTask(_ task: String) {
-        guard let target = currentTarget, let apiKey else { return }
+        guard let target = currentTarget, let apiKey, let codexCredentials else { return }
 
-        let runner = TaskRunner(target: target, goal: task, apiKey: apiKey)
+        let runner = TaskRunner(target: target, goal: task, apiKey: apiKey, credentials: codexCredentials)
         runner.delegate = self
         taskRunner = runner
 
@@ -182,10 +188,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate, TaskRunnerDelegate, Ob
         refreshPermissions()
     }
 
+    private func useCodex(_ tokens: CodexTokens) {
+        codexCredentials = CodexCredentials(tokens: tokens)
+        codexAccount = tokens.email ?? "ChatGPT account"
+    }
+
+    func signInWithChatGPT() {
+        guard !codexSigningIn else { return }
+        codexSigningIn = true
+        Task {
+            defer { codexSigningIn = false }
+            do {
+                let tokens = try await CodexAuth.signIn()
+                try KeychainHelper.saveCodexTokens(tokens)
+                useCodex(tokens)
+                Log.info("ChatGPT sign-in succeeded")
+                showSetup()
+            } catch is CancellationError {
+            } catch {
+                Log.info("ChatGPT sign-in failed")
+                let failure = NSAlert()
+                failure.messageText = "Could not sign in with ChatGPT"
+                failure.informativeText = error.localizedDescription
+                NSApp.activate(ignoringOtherApps: true)
+                failure.runModal()
+            }
+        }
+    }
+
+    func signOutOfChatGPT() {
+        KeychainHelper.deleteCodexTokens()
+        codexCredentials = nil
+        codexAccount = nil
+    }
+
     @objc func promptAPIKey() {
         let alert = NSAlert()
         alert.messageText = "Enter API Key"
-        alert.informativeText = "Jev API key (TypeSafe), stored in macOS Keychain. The goal, observed accessibility text, and recent action results are sent to TypeSafe. Screenshots and OCR processing stay on this Mac. Jev selects text from your request; free-form writing is not supported. Jev remains a remote text-only service."
+        alert.informativeText = "Jev API key (TypeSafe), stored in macOS Keychain. Jev finds the control for each step: the step, observed accessibility text, and recent action results are sent to TypeSafe. Screenshots and OCR processing stay on this Mac."
         alert.alertStyle = .informational
 
         let field = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
@@ -224,7 +264,7 @@ private struct SetupView: View {
                 Image(nsImage: NSApplication.shared.applicationIconImage).resizable().frame(width: 48, height: 48)
                 VStack(alignment: .leading, spacing: 3) {
                     Text("Third Hand").font(.title2.bold())
-                    Text(delegate.accessibilityReady && delegate.keyReady ? "Ready when you are" : "Let’s get set up")
+                    Text(delegate.accessibilityReady && delegate.keyReady && delegate.codexReady ? "Ready when you are" : "Let’s get set up")
                         .foregroundStyle(.secondary)
                 }
             }
@@ -250,7 +290,17 @@ private struct SetupView: View {
                 Spacer()
                 Button("Set API Key…") { delegate.promptAPIKey() }
             }
-            Text("Screen reading stays on-device. Jev selects actions and text from your request.")
+            HStack {
+                Text(delegate.codexAccount.map { "✓ Signed in with ChatGPT (\($0))" }
+                     ?? (delegate.codexSigningIn ? "Finish signing in in your browser…" : "ChatGPT sign-in needed for planning"))
+                Spacer()
+                if delegate.codexReady {
+                    Button("Sign Out") { delegate.signOutOfChatGPT() }
+                } else {
+                    Button("Sign in with ChatGPT…") { delegate.signInWithChatGPT() }.disabled(delegate.codexSigningIn)
+                }
+            }
+            Text("Screen reading stays on-device. ChatGPT plans each step and writes any text; Jev finds the control. Your request and screen text are sent to OpenAI and TypeSafe.")
                 .font(.caption).foregroundStyle(.secondary)
             Text(delegate.shortcutReady ? "✓ Control–Space is ready" : "Shortcut waiting for Accessibility access")
                 .foregroundStyle(.secondary)
