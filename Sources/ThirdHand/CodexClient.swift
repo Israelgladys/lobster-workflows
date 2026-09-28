@@ -38,7 +38,6 @@ struct CodexResponse {
 final class CodexClient {
     nonisolated static let endpoint = URL(string: "https://chatgpt.com/backend-api/codex/responses")!
     nonisolated static let originator = "third_hand"
-    nonisolated static let fastModel = "gpt-6-luna"
     nonisolated static let strongModel = "gpt-6-sol"
     /// A fixed model from `defaults write com.thirdhand.app CodexModel <model>` disables routing.
     nonisolated static var modelOverride: String? { UserDefaults.standard.string(forKey: "CodexModel") }

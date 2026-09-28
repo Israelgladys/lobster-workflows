@@ -2,7 +2,7 @@ import Foundation
 
 struct StepOutcome {
     /// verified, step_complete, or sent (terminal input awaiting Return) let a plan continue;
-    /// unverified, needs_text, blocked, and rejected hand control back to the planner.
+    /// unverified, blocked, and rejected hand control back to the planner.
     let status: String
     let detail: String
     let elements: [AccessibilityElement]
@@ -33,10 +33,10 @@ extension CodexClient: Planner {}
 @MainActor
 protocol ActionLayer: AnyObject {
     func currentElements() async throws -> [AccessibilityElement]
-    func perform(instruction: String, text: String?) async throws -> StepOutcome
+    func perform(step: PlanStep) async throws -> StepOutcome
 }
 
-/// Codex plans the task and writes all text; the action layer (Jev) only grounds and executes each step.
+/// Codex plans the task and writes all text; the action layer resolves each step's label (Jev only when ambiguous) and executes it.
 /// A whole plan runs from one planner turn; Codex is asked again only when a step fails or it wants to check.
 @MainActor
 final class CodexAgent {
@@ -59,18 +59,25 @@ final class CodexAgent {
     You are Third Hand, a macOS assistant that completes tasks in the app the user has focused. \
     You cannot see pixels; you receive the app window's accessibility controls and on-device OCR text.
 
-    Call `act` with the full sequence of small UI steps needed, phrased so a separate action selector can find \
-    each control, e.g. "Click the Search field", "Type into the search field" (with text "adele"), \
-    "Press Return to submit", "Click the first song result named Skyfall". \
-    Put exact text in a step's `text` whenever it enters text; otherwise null. You write all text yourself: \
-    search keywords, messages, commands, and form values. A typing step focuses the field and replaces its \
-    entire contents, so never add steps to clear, select, or click into a field before typing. \
-    Use the fewest steps: usually type, then press Return.
+    Call `act` with the full sequence of steps. Each step is exactly one action:
+    - click: `target` is the control's label copied exactly from the screen list, `role` its role from the list \
+    (e.g. button, row, checkBox).
+    - type: `target` is the field's label copied exactly from the screen, `role` its role, `text` the exact text. \
+    Typing focuses the field and replaces its entire contents, so never add steps to click, clear, or select a \
+    field first.
+    - press: `key` such as return, escape, tab, space, down, or a shortcut like command+f.
+    - scroll: `direction` up or down; `target` optionally names the list or area to scroll.
+    - wait: let content load.
+    Set every field a step doesn't use to null. Only use labels that appear in the screen list; to reach a control \
+    that isn't listed yet, end the plan after the step that reveals it and set `finishes_task` to false. \
+    You write all text yourself: search keywords, messages, commands, and form values. \
+    Use the fewest steps: a search is usually type, then press return.
 
-    Steps run in order and stop at the first one that fails. If the steps will complete the task, set `summary` \
-    to a one-sentence description of the result: when every step succeeds the task ends without asking you again. \
-    Set `summary` to null only when you need to see the resulting screen before deciding what comes next, \
-    for example to choose among search results you can't see yet. \
+    Steps run in order and stop at the first one that fails. Set `finishes_task` to true whenever these steps by \
+    themselves accomplish the request, as with searching, opening, playing, toggling, or typing and sending: \
+    when every step succeeds the task ends without asking you again, and `summary` describes the result. \
+    Set it to false only when you must read content that appears after these steps to choose what to do next, \
+    for example picking a specific search result you can't see yet; `summary` then says what you'll check. \
     If a step fails you get the per-step results and the current screen; plan again from there and change \
     strategy rather than repeating a failed step. Never retype text the screen shows is already entered.
 
@@ -84,15 +91,21 @@ final class CodexAgent {
     nonisolated static let tools: [[String: Any]] = [
         ["type": "function", "name": "act", "strict": true,
          "description": "Perform UI steps in order in the focused app. Stops at the first failed step.",
-         "parameters": ["type": "object", "additionalProperties": false, "required": ["steps", "summary"],
+         "parameters": ["type": "object", "additionalProperties": false, "required": ["finishes_task", "summary", "steps"],
                         "properties": [
+                            "finishes_task": ["type": "boolean", "description": "True if these steps complete the task when they succeed; false only if you must see the result to plan more."],
+                            "summary": ["type": "string", "description": "One sentence: the result if finishes_task, otherwise what you'll check next."],
                             "steps": ["type": "array", "minItems": 1, "maxItems": maxStepsPerPlan,
-                                      "items": ["type": "object", "additionalProperties": false, "required": ["instruction", "text"],
+                                      "items": ["type": "object", "additionalProperties": false,
+                                                "required": ["action", "target", "role", "text", "key", "direction"],
                                                 "properties": [
-                                                    "instruction": ["type": "string", "description": "One concrete action naming the target control."],
-                                                    "text": ["type": ["string", "null"], "description": "Exact text to enter when the step types into a field; otherwise null."]
-                                                ] as [String: Any]] as [String: Any]] as [String: Any],
-                            "summary": ["type": ["string", "null"], "description": "One-sentence result if these steps complete the task; null to see the screen afterward."]
+                                                    "action": ["type": "string", "enum": PlanStep.actions],
+                                                    "target": ["type": ["string", "null"], "description": "Exact on-screen label for click and type; optional area for scroll."],
+                                                    "role": ["type": ["string", "null"], "description": "The target's role as shown in the screen list."],
+                                                    "text": ["type": ["string", "null"], "description": "Exact text for type steps."],
+                                                    "key": ["type": ["string", "null"], "description": "Key or shortcut for press steps, e.g. return or command+f."],
+                                                    "direction": ["type": ["string", "null"], "enum": ["up", "down", NSNull()], "description": "Scroll direction."]
+                                                ] as [String: Any]] as [String: Any]] as [String: Any]
                         ] as [String: Any]] as [String: Any]],
         ["type": "function", "name": "done", "strict": true,
          "description": "Finish: the current screen already shows the task is complete.",
@@ -135,22 +148,17 @@ final class CodexAgent {
         json(["status": "rejected", "detail": detail])
     }
 
-    /// Validated (instruction, text) pairs, or a reason the plan was rejected before any input.
-    nonisolated static func plan(from args: [String: Any]) -> Result<[(String, String?)], ControllerError> {
+    /// Validated steps, or a reason the plan was rejected before any input.
+    nonisolated static func plan(from args: [String: Any]) -> Result<[PlanStep], ControllerError> {
         guard let raw = args["steps"] as? [[String: Any]], !raw.isEmpty, raw.count <= maxStepsPerPlan else {
             return .failure(.invalid("Provide 1–\(maxStepsPerPlan) steps."))
         }
-        var steps: [(String, String?)] = []
-        for step in raw {
-            let instruction = (step["instruction"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-            let text = step["text"] as? String
-            guard !instruction.isEmpty, instruction.utf8.count <= 1000 else {
-                return .failure(.invalid("Every step needs a short, nonempty instruction."))
+        var steps: [PlanStep] = []
+        for (index, item) in raw.enumerated() {
+            switch PlanStep.parse(item) {
+            case .success(let step): steps.append(step)
+            case .failure(let error): return .failure(.invalid("Step \(index + 1): \(error.localizedDescription)"))
             }
-            if let text, text.contains("\0") || text.utf16.count > 12000 {
-                return .failure(.invalid("Text must be under 12,000 characters with no null bytes."))
-            }
-            steps.append((instruction, text))
         }
         return .success(steps)
     }
@@ -194,7 +202,7 @@ final class CodexAgent {
             case "fail":
                 return .failed((args["reason"] as? String).map { String($0.prefix(400)) } ?? "The task could not be completed.")
             case "act":
-                let steps: [(String, String?)]
+                let steps: [PlanStep]
                 switch Self.plan(from: args) {
                 case .failure(let error):
                     input.append(["type": "function_call_output", "call_id": call.callID, "output": Self.rejection(error.localizedDescription)])
@@ -202,19 +210,20 @@ final class CodexAgent {
                     continue
                 case .success(let plan): steps = plan
                 }
-                Log.info("Plan steps=\(steps.count) finishes=\(args["summary"] is String)")
+                let finishes = args["finishes_task"] as? Bool ?? false
+                Log.info("Plan steps=\(steps.count) finishes=\(finishes)")
                 var results: [[String: Any]] = []
                 var last: StepOutcome?
                 for (index, step) in steps.enumerated() {
-                    let outcome = try await layer.perform(instruction: step.0, text: step.1)
-                    Log.info("Step \(index + 1)/\(steps.count) status=\(outcome.status)")
-                    results.append(["step": index + 1, "status": outcome.status, "detail": outcome.detail])
+                    let outcome = try await layer.perform(step: step)
+                    Log.info("Step \(index + 1)/\(steps.count) action=\(step.action) status=\(outcome.status)")
+                    results.append(["step": index + 1, "action": step.summary, "status": outcome.status, "detail": outcome.detail])
                     last = outcome
                     if !outcome.succeeded { break }
                 }
                 let completed = last?.succeeded == true && results.count == steps.count
-                if completed, let summary = args["summary"] as? String {
-                    return .done(String(summary.prefix(400)))
+                if completed, finishes {
+                    return .done(String((args["summary"] as? String ?? "Done.").prefix(400)))
                 }
                 if results.count < steps.count {
                     results.append(["not_run": Array((results.count + 1)...steps.count)])

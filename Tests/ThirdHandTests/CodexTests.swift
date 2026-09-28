@@ -224,8 +224,8 @@ private final class RecordingLayer: ActionLayer {
     func currentElements() async throws -> [AccessibilityElement] {
         [AccessibilityElement(id: 1, role: "AXTextField", label: "Search", value: nil, enabled: true, actions: [], axElement: nil)]
     }
-    func perform(instruction: String, text: String?) async throws -> StepOutcome {
-        steps.append((instruction, text))
+    func perform(step: PlanStep) async throws -> StepOutcome {
+        steps.append((step.target ?? step.key ?? step.action, step.text))
         let status = statuses.isEmpty ? "verified" : statuses.removeFirst()
         return StepOutcome(status: status, detail: "ok", elements: [
             AccessibilityElement(id: 1, role: "AXTextField", label: "Search", value: "screen \(steps.count)", enabled: true, actions: [], axElement: nil)
@@ -239,15 +239,26 @@ private func call(_ id: String, _ name: String, _ args: [String: Any?]) -> [Stri
 }
 
 private func act(_ id: String, _ steps: [(String, String?)], summary: String?) -> [String: Any] {
-    call(id, "act", ["steps": steps.map { ["instruction": $0.0, "text": $0.1 as Any? ?? NSNull()] }, "summary": summary])
+    // ("Press Return", nil) is a press step, (label, text) a type step, and (label, nil) a click step.
+    func step(_ label: String, _ text: String?) -> [String: Any] {
+        var step: [String: Any] = ["action": "click", "target": label, "role": NSNull(), "text": NSNull(), "key": NSNull(), "direction": NSNull()]
+        if label.hasPrefix("Press ") {
+            step["action"] = "press"; step["target"] = NSNull(); step["key"] = String(label.dropFirst(6)).lowercased()
+        } else if let text {
+            step["action"] = "type"; step["text"] = text
+        }
+        return step
+    }
+    return call(id, "act", ["steps": steps.map { step($0.0, $0.1) },
+                     "finishes_task": summary != nil, "summary": summary ?? "Check the results."])
 }
 
-private let fast = PlannerTier(model: "gpt-6-luna", effort: "none")
+private let fast = PlannerTier(model: "gpt-6-sol", effort: "none")
 
 @MainActor
 final class CodexAgentTests: XCTestCase {
-    func testFailedPlanEscalatesToStrongTierWithoutForeignReasoning() async throws {
-        let reasoning: [String: Any] = ["type": "reasoning", "id": "rs_1", "encrypted_content": "luna-only"]
+    func testFailedPlanEscalatesEffortAndKeepsSameModelReasoning() async throws {
+        let reasoning: [String: Any] = ["type": "reasoning", "id": "rs_1", "encrypted_content": "sol"]
         let planner = ScriptedPlanner([
             [reasoning, act("c1", [("Click Search", nil)], summary: "Searched.")],
             [call("c2", "done", ["summary": "ok"])]
@@ -256,15 +267,29 @@ final class CodexAgentTests: XCTestCase {
         layer.statuses = ["blocked"]
         let outcome = try await CodexAgent(planner: planner, tier: fast, escalation: .strong).run(goal: "g", appName: "App", layer: layer)
         XCTAssertEqual(outcome, .done("ok"))
-        XCTAssertEqual(planner.models, ["gpt-6-luna/none", "gpt-6-sol/low"])
-        XCTAssertFalse(planner.inputs[1].contains { $0["type"] as? String == "reasoning" })
+        XCTAssertEqual(planner.models, ["gpt-6-sol/none", "gpt-6-sol/low"])
+        XCTAssertTrue(planner.inputs[1].contains { $0["type"] as? String == "reasoning" }, "Same-model reasoning is kept")
         XCTAssertEqual(planner.inputs[1].filter { $0["type"] as? String == "function_call_output" }.count, 1)
+    }
+
+    func testSwitchingModelsDropsForeignReasoning() async throws {
+        let reasoning: [String: Any] = ["type": "reasoning", "id": "rs_1", "encrypted_content": "other-model"]
+        let planner = ScriptedPlanner([
+            [reasoning, act("c1", [("Click Search", nil)], summary: "Searched.")],
+            [call("c2", "done", ["summary": "ok"])]
+        ])
+        let layer = RecordingLayer()
+        layer.statuses = ["blocked"]
+        _ = try await CodexAgent(planner: planner, tier: PlannerTier(model: "gpt-other", effort: "none"), escalation: .strong)
+            .run(goal: "g", appName: "App", layer: layer)
+        XCTAssertEqual(planner.models, ["gpt-other/none", "gpt-6-sol/low"])
+        XCTAssertFalse(planner.inputs[1].contains { $0["type"] as? String == "reasoning" })
     }
 
     func testSuccessfulPlanNeverEscalates() async throws {
         let planner = ScriptedPlanner([[act("c1", [("Click Search", nil)], summary: "Done.")]])
         _ = try await CodexAgent(planner: planner, tier: fast, escalation: .strong).run(goal: "g", appName: "App", layer: RecordingLayer())
-        XCTAssertEqual(planner.models, ["gpt-6-luna/none"])
+        XCTAssertEqual(planner.models, ["gpt-6-sol/none"])
     }
 
     func testWholeTaskRunsFromOnePlannerTurn() async throws {
@@ -275,7 +300,7 @@ final class CodexAgentTests: XCTestCase {
         let outcome = try await CodexAgent(planner: planner, tier: fast).run(goal: "search skyfall", appName: "Spotify", layer: layer)
         XCTAssertEqual(outcome, .done("Searched for Skyfall."))
         XCTAssertEqual(planner.inputs.count, 1)
-        XCTAssertEqual(layer.steps.map(\.0), ["Click the Search field", "Type into the search field", "Press Return"])
+        XCTAssertEqual(layer.steps.map(\.0), ["Click the Search field", "Type into the search field", "return"])
         XCTAssertEqual(layer.steps[1].1, "Adele — Skyfall (2012)", "Planner text is typed verbatim")
         XCTAssertNil(layer.steps[2].1)
     }
@@ -356,10 +381,10 @@ final class CodexAgentTests: XCTestCase {
         XCTAssertTrue(output?.contains("rejected") == true)
     }
 
-    func testActToolRequiresStepsAndNullableSummary() throws {
+    func testActToolRequiresExplicitFinishDecision() throws {
         let act = CodexAgent.tools.first { $0["name"] as? String == "act" }!
         let parameters = act["parameters"] as! [String: Any]
-        XCTAssertEqual(parameters["required"] as? [String], ["steps", "summary"])
+        XCTAssertEqual(parameters["required"] as? [String], ["finishes_task", "summary", "steps"])
         XCTAssertEqual(act["strict"] as? Bool, true)
     }
 }
@@ -367,13 +392,12 @@ final class CodexAgentTests: XCTestCase {
 @MainActor
 final class PlannerRoutingTests: XCTestCase {
     func testRoutingDecodesTierAndRejectsUnknownChoices() {
-        func answer(_ model: String, _ effort: String) -> Data {
-            Data(#"{"answers":{"planner_model":{"choice":"\#(model)"},"planner_effort":{"choice":"\#(effort)"}}}"#.utf8)
+        func answer(_ effort: String) -> Data {
+            Data(#"{"answers":{"planner_effort":{"choice":"\#(effort)"}}}"#.utf8)
         }
-        XCTAssertEqual(JevClient.decodeTier(answer("luna", "none")), PlannerTier(model: "gpt-6-luna", effort: "none"))
-        XCTAssertEqual(JevClient.decodeTier(answer("sol", "low")), PlannerTier(model: "gpt-6-sol", effort: "low"))
-        XCTAssertNil(JevClient.decodeTier(answer("gpt-9", "low")))
-        XCTAssertNil(JevClient.decodeTier(answer("luna", "high")))
+        XCTAssertEqual(JevClient.decodeTier(answer("none")), PlannerTier(model: "gpt-6-sol", effort: "none"))
+        XCTAssertEqual(JevClient.decodeTier(answer("low")), PlannerTier(model: "gpt-6-sol", effort: "low"))
+        XCTAssertNil(JevClient.decodeTier(answer("high")))
     }
 
     func testRoutingFailureFallsBackToStrongTier() async {
@@ -381,7 +405,7 @@ final class PlannerRoutingTests: XCTestCase {
         let tier = await JevClient(apiKey: "k", session: session).choosePlannerTier(goal: "search", appName: "Spotify")
         XCTAssertEqual(tier, .strong)
         let body = try! JSONSerialization.jsonObject(with: StubProtocol.requests[0].httpBody!) as! [String: Any]
-        XCTAssertEqual(Set((body["questions"] as! [String: Any]).keys), ["planner_model", "planner_effort"])
+        XCTAssertEqual(Set((body["questions"] as! [String: Any]).keys), ["planner_effort"])
     }
 
     func testRejectedEffortRetriesWithLow() async throws {
@@ -393,8 +417,26 @@ final class PlannerRoutingTests: XCTestCase {
             return effort == "minimal" ? (400, Data(#"{"error":{"message":"Unsupported value: minimal"}}"#.utf8)) : (200, done)
         }
         let client = CodexClient(credentials: CodexCredentials(tokens: fixtureTokens), session: session)
-        let response = try await client.respond(model: "gpt-6-luna", instructions: "x", input: [], tools: [], effort: "minimal")
+        let response = try await client.respond(model: "gpt-6-sol", instructions: "x", input: [], tools: [], effort: "minimal")
         XCTAssertEqual(response.functionCalls.first?.name, "done")
         XCTAssertEqual(StubProtocol.requests.count, 2)
+    }
+}
+
+@MainActor
+final class PlanValidationTests: XCTestCase {
+    func testPlanNamesTheFailingStep() {
+        let args: [String: Any] = ["steps": [["action": "click", "target": "Play"], ["action": "type", "target": "Search"]]]
+        guard case .failure(let error) = CodexAgent.plan(from: args) else { return XCTFail("Missing text must reject the plan") }
+        XCTAssertTrue(error.localizedDescription.hasPrefix("Step 2:"))
+    }
+
+    func testStepSchemaFixesTheActionSet() throws {
+        let act = CodexAgent.tools.first { $0["name"] as? String == "act" }!
+        let steps = (act["parameters"] as! [String: Any])["properties"] as! [String: Any]
+        let item = (steps["steps"] as! [String: Any])["items"] as! [String: Any]
+        XCTAssertEqual(item["required"] as? [String], ["action", "target", "role", "text", "key", "direction"])
+        let action = (item["properties"] as! [String: Any])["action"] as! [String: Any]
+        XCTAssertEqual(action["enum"] as? [String], ["click", "type", "press", "scroll", "wait"])
     }
 }

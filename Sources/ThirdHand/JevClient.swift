@@ -1,19 +1,13 @@
 import Foundation
 
-struct JevResult {
-    let decision: AgentDecision
-    let done: Double
-    let absent: Double
-    let pickedNone: Bool
-    let latencyMs: Int
-}
-
 struct JevServiceError: LocalizedError {
     let status: Int
     let detail: String
     var errorDescription: String? { "Jev rejected the request (HTTP \(status)): \(detail)" }
 }
 
+/// Jev resolves a planner step's label to one on-screen element and routes tasks to a planner tier.
+/// It never chooses the kind of action: the planner fixes that before Jev is asked.
 @MainActor
 final class JevClient {
     private let apiKey: String
@@ -21,9 +15,9 @@ final class JevClient {
     private let endpoint: URL
 
     nonisolated static let maxChoices = 255
-    nonisolated static let doneThreshold = 0.70
-    nonisolated static let absentThreshold = 0.50
-    nonisolated private static let noneKey = "__none__"
+    nonisolated static let noneKey = "__none__"
+    // Application budget, deliberately below the service's context limits.
+    nonisolated static let maxRequestBytes = 24_000
 
     init(apiKey: String, session: URLSession = .shared,
          endpoint: URL = URL(string: "https://api.typesafe.ai/v1/systemone")!) {
@@ -62,202 +56,117 @@ final class JevClient {
         return result
     }
 
-    /// Leave one slot for the explicit none-of-the-above choice. Prefer focused
-    /// controls and labels relevant to the goal, preserving snapshot order on ties.
-    nonisolated static func offeredTargets(_ elements: [AccessibilityElement], goal: String) -> [String: [String: AccessibilityElement]] {
-        let words = Set(goal.lowercased().split(whereSeparator: { !$0.isLetter && !$0.isNumber }).map(String.init).filter { $0.count > 2 })
-        let positions = Dictionary(elements.enumerated().map { (String($0.element.id), $0.offset) }, uniquingKeysWith: min)
+    // MARK: - Grounding
+
+    /// Candidates ordered by overlap with the target label, then role and focus, preserving snapshot order on ties.
+    /// One slot is left for the explicit none-of-the-above choice.
+    nonisolated static func shortlist(_ candidates: [AccessibilityElement], target: String, role: String?) -> [AccessibilityElement] {
+        func words(_ text: String) -> Set<String> {
+            Set(text.lowercased().split(whereSeparator: { !$0.isLetter && !$0.isNumber }).map(String.init))
+        }
+        let wanted = words(target)
         func relevance(_ element: AccessibilityElement) -> Int {
-            let labelWords = Set(element.displayLabel.lowercased().split(whereSeparator: { !$0.isLetter && !$0.isNumber }).map(String.init))
-            return words.intersection(labelWords).count * 10 + (element.focused ? 5 : 0)
+            wanted.intersection(words(element.displayLabel)).count * 10
+                + (role.map { StepMatcher.normalize($0) == StepMatcher.normalize(element.displayRole) } == true ? 5 : 0)
+                + (element.focused ? 3 : 0)
         }
-        return targets(elements).mapValues { candidates in
-            let ordered = candidates.values.sorted {
-                let lhs = relevance($0), rhs = relevance($1)
-                return lhs == rhs ? positions[String($0.id), default: 0] < positions[String($1.id), default: 0] : lhs > rhs
-            }
-            return Dictionary(uniqueKeysWithValues: ordered.prefix(maxChoices - 1).map { (String($0.id), $0) })
-        }
+        return candidates.enumerated()
+            .sorted { relevance($0.element) == relevance($1.element) ? $0.offset < $1.offset : relevance($0.element) > relevance($1.element) }
+            .prefix(maxChoices - 1)
+            .map(\.element)
     }
 
-    nonisolated static func requestBody(goal: String, elements: [AccessibilityElement], appName: String, history: [ActionHistory]) -> [String: Any] {
-        let targets = offeredTargets(elements, goal: goal)
-
-        var operations: [String: String] = [
-            "SCROLL_UP": "Reveal content above",
-            "SCROLL_DOWN": "Reveal content below",
-            "PRESS_RETURN": "Submit the focused field or confirm the selected item",
-            "PRESS_TAB": "Move focus to the next control",
-            "PRESS_ESCAPE": "Dismiss the current popup or menu",
-            "WAIT": "Wait for content to load",
-            "DONE": "All requirements are visibly satisfied on screen",
-            "BLOCKED": "No available operation can make progress"
-        ]
-        for op in targets.keys {
-            if op == "CLICK_TEXT" {
-                operations[op] = "Click an OCR text region only when its label clearly identifies the requested control. OCR does not prove interactivity; never click headings or ordinary content."
-                continue
-            }
-            operations[op] = op == "TYPE_TEXT"
-                ? "Set text in an editable field"
-                : "Click an observed enabled control"
-        }
-
-        let state: [String: Any] = [
-            "task": goal,
-            "app": appName,
-            "step": history.count + 1,
-            "action_attempts": history.isEmpty
-                ? ["nothing yet"] as [Any]
-                : history.suffix(8).map { "\($0.action): \($0.result)" } as [Any],
-            "observationMayBeTruncated": elements.count >= 500,
-            "targetChoicesShortlisted": Self.targets(elements).contains { targets[$0.key]?.count != $0.value.count },
-            "elements": elements.map { el in
-                var desc: [String: Any] = ["id": String(el.id), "label": el.displayLabel, "role": el.displayRole, "enabled": el.enabled, "focused": el.focused, "source": el.source]
-                if let v = el.value, !v.isEmpty, v != el.label { desc["value"] = v }
-                return desc
-            }
-        ]
-
-        var questions: [String: Any] = [
-            "done": [
-                "type": "noul",
-                "instructions": "Has this task been completed: \"\(goal)\"? Judge only by what is visible on screen and actions already taken."
-            ] as [String: Any],
-            "absent": [
-                "type": "noul",
-                "instructions": "Is the control needed for the next step of \"\(goal)\" missing from the elements on screen?"
-            ] as [String: Any],
-            "operation": [
-                "type": "choice",
-                "criteria": operations,
-                "instructions": "Which operation advances \"\(goal)\" one step? Do not repeat completed steps. DONE requires visible evidence."
-            ] as [String: Any]
-        ]
-
-        for (op, candidates) in targets {
-            var criteria: [String: String] = [:]
-            for (id, el) in candidates {
-                var desc = el.displayLabel
-                if let v = el.value, !v.isEmpty, v != el.label { desc += " = \(v)" }
-                desc += " [\(el.displayRole)]"
-                criteria[id] = desc
-            }
-            criteria[noneKey] = "None of these — the needed control is not on screen"
-            questions[op.lowercased() + "_target"] = [
-                "type": "choice",
-                "criteria": criteria,
-                "instructions": "Which element should be the target for \(op) to advance \"\(goal)\"?"
-            ] as [String: Any]
-        }
-
-        return ["model": "jev-latest", "questions": questions, "state": state]
-    }
-
-    // Application budget, deliberately below the service's context limits.
-    nonisolated static let maxRequestBytes = 24_000
-
-    nonisolated static func preparedRequest(goal: String, elements: [AccessibilityElement], appName: String,
-                                           history: [ActionHistory]) throws -> (data: Data, offered: [String: [String: AccessibilityElement]]) {
-        guard goal.utf8.count <= 4000 else {
-            throw ControllerError.invalid("Please shorten the request to fit the action selector.")
-        }
-        let words = Set(goal.lowercased().split(whereSeparator: { !$0.isLetter && !$0.isNumber }).filter { $0.count > 2 }.map(String.init))
-        func score(_ el: AccessibilityElement) -> Int {
-            let label = Set(el.displayLabel.lowercased().split(whereSeparator: { !$0.isLetter && !$0.isNumber }).map(String.init))
-            return (el.focused ? 1000 : 0) + (el.isOutcomeEvidence ? 900 : 0) + words.intersection(label).count * 20
-                + (["AXTextField", "AXTextArea", "AXComboBox"].contains(el.role) ? 10 : 0)
-        }
-        var selected = elements.enumerated().sorted {
-            let a = score($0.element), b = score($1.element)
-            return a == b ? $0.offset < $1.offset : a > b
-        }.prefix(160).map { $0.element }
-        let attempts = history.suffix(4).map {
-            ActionHistory(action: String($0.action.prefix(256)), result: String($0.result.prefix(256)))
-        }
+    nonisolated static func groundRequest(action: String, target: String, role: String?, candidates: [AccessibilityElement],
+                                          appName: String) throws -> (data: Data, offered: [String: AccessibilityElement]) {
+        var selected = shortlist(candidates, target: target, role: role)
+        let verb = action == "type" ? "type into" : "click"
+        let described = role.map { "the \($0) labelled \"\(target)\"" } ?? "the control labelled \"\(target)\""
         while true {
-            let compact = selected.map { el in
-                AccessibilityElement(id: el.id, role: el.role, label: String(el.displayLabel.prefix(160)),
-                    value: el.value.map { String($0.prefix(160)) }, enabled: el.enabled, actions: el.actions,
-                    axElement: el.axElement, frame: el.frame, focused: el.focused, source: el.source)
+            var criteria: [String: String] = [:]
+            for element in selected {
+                var desc = String(element.displayLabel.prefix(160))
+                if let value = element.value, !value.isEmpty, value != element.label { desc += " = \(value.prefix(160))" }
+                desc += " [\(element.displayRole)]"
+                if element.source == "ocr" { desc += " (ocr text)" }
+                criteria[String(element.id)] = desc
             }
-            var body = requestBody(goal: goal, elements: compact, appName: String(appName.prefix(100)), history: attempts)
-            var state = body["state"] as! [String: Any]
-            state["observationMayBeTruncated"] = true
-            state["observedElementCount"] = elements.count
-            state["step"] = history.count + 1
-            body["state"] = state
+            criteria[noneKey] = "None of these is \(described)"
+            let body: [String: Any] = [
+                "model": "jev-latest",
+                "state": ["app": String(appName.prefix(100)), "action": action, "target": target, "role": role ?? ""],
+                "questions": ["target": [
+                    "type": "choice", "criteria": criteria,
+                    "instructions": "The planner wants to \(verb) \(described). Which element is it? Labels may differ slightly in wording, case, or truncation. OCR text is only valid when it names that control. Choose none if no element plausibly is it."
+                ] as [String: Any]]
+            ]
             let data = try JSONSerialization.data(withJSONObject: body)
             if data.count <= maxRequestBytes {
-                // Decode only targets present in this exact request, using original metadata.
-                let ids = offeredTargets(compact, goal: goal).mapValues { Set($0.keys) }
-                let offered = targets(selected).mapValues { candidates in candidates }
-                    .reduce(into: [String: [String: AccessibilityElement]]()) { result, pair in
-                        result[pair.key] = pair.value.filter { ids[pair.key]?.contains($0.key) == true }
-                    }
-                return (data, offered)
+                return (data, Dictionary(uniqueKeysWithValues: selected.map { (String($0.id), $0) }))
             }
-            guard !selected.isEmpty else {
-                throw ControllerError.invalid("The request is too large for the action selector. Please shorten it.")
+            guard selected.count > 1 else {
+                throw ControllerError.invalid("The step target is too large for the action selector.")
             }
             selected = Array(selected.prefix(selected.count / 2))
         }
     }
 
-    func decide(goal: String, elements: [AccessibilityElement], appName: String, history: [ActionHistory]) async throws -> JevResult {
+    nonisolated static func decodeGround(_ data: Data, offered: [String: AccessibilityElement]) throws -> AccessibilityElement? {
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let choice = ((json["answers"] as? [String: Any])?["target"] as? [String: Any])?["choice"] as? String else {
+            throw ControllerError.invalid("Invalid Jev response")
+        }
+        if choice == noneKey { return nil }
+        guard let element = offered[choice] else { throw ControllerError.invalid("Jev chose a target that was not offered.") }
+        return element
+    }
+
+    /// The element a step's label refers to among action-compatible candidates, or nil when none matches.
+    func ground(action: String, target: String, role: String?, candidates: [AccessibilityElement],
+                appName: String) async throws -> AccessibilityElement? {
+        let prepared = try Self.groundRequest(action: action, target: target, role: role, candidates: candidates, appName: appName)
         var request = URLRequest(url: endpoint, timeoutInterval: 15)
         request.httpMethod = "POST"
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        let prepared = try Self.preparedRequest(goal: goal, elements: elements, appName: appName, history: history)
         request.httpBody = prepared.data
-        let offered = prepared.offered
-        let maxChoiceCount = max(8 + offered.count, (offered.values.map(\.count).max() ?? 0) + 1)
-        Log.info("Jev request bytes=\(request.httpBody?.count ?? 0) max_choices=\(maxChoiceCount)")
+        Log.info("Jev ground bytes=\(prepared.data.count) choices=\(prepared.offered.count + 1)")
         let start = Date()
-        let (data, response) = try await AsyncTimeout.run(seconds: 15, message: "Action selection timed out.") { [session] in
+        let (data, response) = try await AsyncTimeout.run(seconds: 15, message: "Target selection timed out.") { [session] in
             try await session.data(for: request)
         }
         try Task.checkCancellation()
-        let ms = Int(Date().timeIntervalSince(start) * 1000)
-        Log.info("Timing jev_ms=\(ms)")
+        Log.info("Timing jev_ms=\(Int(Date().timeIntervalSince(start) * 1000))")
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
             let code = (response as? HTTPURLResponse)?.statusCode ?? 0
             let detail = Self.errorDetail(data, redacting: apiKey)
             Log.info("Jev error HTTP \(code) detail=\(detail.replacingOccurrences(of: "\n", with: " "))")
             throw JevServiceError(status: code, detail: detail)
         }
-        return try Self.decode(data, elements: elements, latencyMs: ms, offered: offered)
+        return try Self.decodeGround(data, offered: prepared.offered)
     }
+
+    // MARK: - Planner routing
 
     nonisolated static func routingBody(goal: String, appName: String) -> [String: Any] {
         ["model": "jev-latest", "state": ["task": goal, "app": appName],
          "questions": [
-            "planner_model": ["type": "choice", "criteria": [
-                "luna": "Short, well-specified UI task: search, open, play, click or toggle something, or enter text the user supplied",
-                "sol": "Needs judgment or composition: several goals, writing new text, comparing or choosing among options, or unfamiliar multi-screen workflows"
-            ], "instructions": "Which planner does this computer-use task need? Prefer luna unless the task clearly needs more reasoning."] as [String: Any],
             "planner_effort": ["type": "choice", "criteria": [
-                "none": "The steps are obvious from the request",
-                "low": "The steps need some thought about the app or the order of actions"
-            ], "instructions": "How much planning effort does this task need?"] as [String: Any]
+                "none": "Short, well-specified UI task whose steps are obvious: search, open, play, click or toggle something, or enter text the user supplied",
+                "low": "Needs judgment or composition: several goals, writing new text, comparing or choosing among options, or unfamiliar multi-screen workflows"
+            ], "instructions": "How much planning effort does this computer-use task need? Prefer none unless the task clearly needs more reasoning."] as [String: Any]
          ] as [String: Any]]
     }
 
     nonisolated static func decodeTier(_ data: Data) -> PlannerTier? {
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let answers = json["answers"] as? [String: Any],
-              let model = (answers["planner_model"] as? [String: Any])?["choice"] as? String,
               let effort = (answers["planner_effort"] as? [String: Any])?["choice"] as? String,
               ["none", "low"].contains(effort) else { return nil }
-        switch model {
-        case "luna": return PlannerTier(model: CodexClient.fastModel, effort: effort)
-        case "sol": return PlannerTier(model: CodexClient.strongModel, effort: effort)
-        default: return nil
-        }
+        return PlannerTier(model: CodexClient.strongModel, effort: effort)
     }
 
-    /// Picks the planner model and effort for a task; falls back to the strong tier on any failure.
+    /// Picks the planner effort for a task (gpt-6-luna was no faster and less reliable at finishing plans);
+    /// falls back to the strong tier on any failure.
     func choosePlannerTier(goal: String, appName: String) async -> PlannerTier {
         do {
             var request = URLRequest(url: endpoint, timeoutInterval: 5)
@@ -293,59 +202,5 @@ final class JevClient {
         let safe = key.isEmpty ? message : message.replacingOccurrences(of: key, with: "[redacted]")
         // Preserve the bounded validation message, never the raw response or input fields.
         return String(safe.prefix(400))
-    }
-
-    // MARK: - Decode
-
-    nonisolated static func decode(_ data: Data, elements: [AccessibilityElement], latencyMs: Int = 0, offered: [String: [String: AccessibilityElement]]? = nil) throws -> JevResult {
-        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let answers = json["answers"] as? [String: Any] else {
-            throw ControllerError.invalid("Invalid Jev response")
-        }
-
-        let done = (answers["done"] as? [String: Any])?["noul"] as? Double ?? 0
-        let absent = (answers["absent"] as? [String: Any])?["noul"] as? Double ?? 0
-
-        guard let opAnswer = answers["operation"] as? [String: Any],
-              let opChoice = opAnswer["choice"] as? String else {
-            throw ControllerError.invalid("Missing operation in Jev response")
-        }
-
-        let targets = offered ?? targets(elements)
-        let allowed = Set(targets.keys).union(["SCROLL_UP", "SCROLL_DOWN", "PRESS_RETURN", "PRESS_ESCAPE", "PRESS_TAB", "WAIT", "DONE", "BLOCKED"])
-        guard allowed.contains(opChoice) else { throw ControllerError.invalid("Unsupported Jev operation") }
-
-        if let candidates = targets[opChoice] {
-            let key = opChoice.lowercased() + "_target"
-            guard let tgtAnswer = answers[key] as? [String: Any],
-                  let tgtChoice = tgtAnswer["choice"] as? String else {
-                throw ControllerError.invalid("Missing target for \(opChoice)")
-            }
-            if tgtChoice == noneKey {
-                return JevResult(
-                    decision: AgentDecision(operation: "BLOCKED", reason: "Target not visible on screen"),
-                    done: done, absent: absent, pickedNone: true, latencyMs: latencyMs
-                )
-            }
-            guard candidates[tgtChoice] != nil else {
-                throw ControllerError.invalid("Invalid target \(tgtChoice)")
-            }
-            return JevResult(
-                decision: AgentDecision(operation: opChoice, targetIndex: tgtChoice),
-                done: done, absent: absent, pickedNone: false, latencyMs: latencyMs
-            )
-        }
-
-        if ["PRESS_RETURN", "PRESS_ESCAPE", "PRESS_TAB"].contains(opChoice) {
-            return JevResult(
-                decision: AgentDecision(operation: "KEY_PRESS", key: ["PRESS_RETURN": "return", "PRESS_ESCAPE": "escape", "PRESS_TAB": "tab"][opChoice]),
-                done: done, absent: absent, pickedNone: false, latencyMs: latencyMs
-            )
-        }
-
-        return JevResult(
-            decision: AgentDecision(operation: opChoice),
-            done: done, absent: absent, pickedNone: false, latencyMs: latencyMs
-        )
     }
 }

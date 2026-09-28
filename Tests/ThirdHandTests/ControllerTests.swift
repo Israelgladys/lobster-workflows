@@ -76,12 +76,6 @@ final class ControllerTests: XCTestCase {
         XCTAssertTrue(snapshot.frame.contains(snapshot.point(x: 1, y: 1)))
     }
 
-    func testMalformedJevResponseFailsCleanly() {
-        for payload in ["{}", "not json", #"{"answers":{}}"#] {
-            XCTAssertThrowsError(try JevClient.decode(Data(payload.utf8), elements: []))
-        }
-    }
-
     func testOCRTextUsesExplicitClickTextRatherThanPretendingToBeAButton() throws {
         let text = AccessibilityElement(id: 10, role: "AXStaticText", label: "Save", value: nil,
             enabled: true, actions: [], axElement: nil, frame: CGRect(x: 20, y: 20, width: 40, height: 20), source: "ocr")

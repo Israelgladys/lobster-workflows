@@ -127,13 +127,21 @@ final class TaskRunner: ActionLayer {
         return observation.elements
     }
 
-    /// One planner step: Jev grounds the instruction to a control; the planner's text is typed verbatim.
-    func perform(instruction: String, text: String?) async throws -> StepOutcome {
+    /// Candidates compatible with a step's action, in snapshot order.
+    private func pool(for action: String, in elements: [AccessibilityElement]) -> [AccessibilityElement] {
+        let targets = JevClient.targets(elements)
+        let ids = action == "type"
+            ? Set((targets["TYPE_TEXT"] ?? [:]).keys)
+            : Set((targets["CLICK"] ?? [:]).keys).union((targets["CLICK_TEXT"] ?? [:]).keys)
+        return elements.filter { ids.contains(String($0.id)) }
+    }
+
+    /// One planner step. The action is fixed by the planner; a click or type target is resolved by exact label
+    /// when unique, otherwise Jev chooses among controls compatible with that action only.
+    func perform(step: PlanStep) async throws -> StepOutcome {
         guard actions < maxSteps else {
             throw ControllerError.invalid("Stopped after \(maxSteps) actions. The final screen does not confirm completion.")
         }
-        // Jev's done/absent questions are scoped to the step, not the whole task.
-        let stepGoal = text.map { "\(instruction) (text to enter: \"\($0.prefix(200))\")" } ?? instruction
         var latest: [AccessibilityElement] = []
         // Separate observation budget bounds stale-window retries and recovery within a step.
         for _ in 0..<4 {
@@ -147,50 +155,54 @@ final class TaskRunner: ActionLayer {
             latest = observation.elements
             try checkFocus()
             var decision: AgentDecision
-            do {
-                phase = "selecting_action"
-                let result = try await jev.decide(goal: stepGoal, elements: observation.elements, appName: target.name, history: history)
-                Log.info("Decision operation=\(result.decision.operation) done=\(result.done) absent=\(result.absent)")
-                // A text step is only already satisfied when some field visibly holds that text.
-                let textPresent = text.map { text in observation.elements.contains { $0.value == text } } ?? true
-                decision = result.done >= JevClient.doneThreshold && textPresent ? AgentDecision(operation: "DONE") : result.decision
-            } catch is CancellationError { throw CancellationError() }
-            catch let error as JevServiceError { throw error }
-            catch {
-                try checkFocus()
-                return StepOutcome(status: "blocked", detail: "The action selector failed: \(error.localizedDescription)", elements: latest)
+            switch step.action {
+            case "press":
+                decision = AgentDecision(operation: "KEY_PRESS", key: step.key, modifiers: step.modifiers.isEmpty ? nil : step.modifiers)
+            case "wait":
+                decision = AgentDecision(operation: "WAIT")
+            case "scroll":
+                let anchor = step.target.flatMap { StepMatcher.exact(target: $0, role: step.role, in: observation.elements).first }
+                decision = AgentDecision(operation: step.direction == "up" ? "SCROLL_UP" : "SCROLL_DOWN", targetIndex: anchor.map { String($0.id) })
+            default:
+                let label = step.target ?? ""
+                let candidates = pool(for: step.action, in: observation.elements)
+                let matches = StepMatcher.exact(target: label, role: step.role, in: candidates)
+                var chosen: AccessibilityElement?
+                if matches.count == 1 {
+                    chosen = matches[0]
+                    Log.info("Grounded via=exact action=\(step.action)")
+                } else if !candidates.isEmpty {
+                    phase = "grounding"
+                    do {
+                        chosen = try await jev.ground(action: step.action, target: label, role: step.role,
+                                                      candidates: matches.count > 1 ? matches : candidates, appName: target.name)
+                    } catch is CancellationError { throw CancellationError() }
+                    catch let error as JevServiceError { throw error }
+                    catch {
+                        try checkFocus()
+                        return StepOutcome(status: "blocked", detail: "The action selector failed: \(error.localizedDescription)", elements: latest)
+                    }
+                    Log.info("Grounded via=jev action=\(step.action) duplicates=\(matches.count) found=\(chosen != nil)")
+                }
+                guard let chosen else {
+                    let reason = "No \(step.action == "type" ? "editable field" : "clickable control") labelled \"\(label)\" is on screen."
+                    if enableOCR(reason) { continue }
+                    let permission = useOCR || CGPreflightScreenCaptureAccess() ? "" : " Enable Screen Recording for Third Hand to read unlabeled screen text."
+                    return StepOutcome(status: "blocked", detail: reason + permission + " Use a label from the current screen, or scroll or open a menu first.", elements: latest)
+                }
+                if step.action == "type" {
+                    guard !(target.isTerminal && terminalInputPending) else {
+                        return StepOutcome(status: "rejected", detail: "Terminal input was already entered and not submitted. Press Return to run it, or clear the line first.", elements: latest)
+                    }
+                    decision = AgentDecision(operation: "TYPE_TEXT", targetIndex: String(chosen.id), textValue: step.text)
+                } else {
+                    decision = AgentDecision(operation: chosen.source == "ocr" ? "CLICK_TEXT" : "CLICK", targetIndex: String(chosen.id))
+                }
             }
             try checkFocus()
             guard isCurrent(observation) else {
                 history.append(ActionHistory(action: "OBSERVE", result: "Window moved or changed; discarded stale decision."))
                 continue
-            }
-            if decision.operation == "DONE" {
-                return StepOutcome(status: "step_complete", detail: "The action selector judged this step already satisfied on screen; no input was sent.", elements: latest)
-            }
-            if decision.operation == "BLOCKED" {
-                let reason = decision.reason ?? "The control for this step is not visible."
-                if enableOCR(reason) { continue }
-                let permission = useOCR || CGPreflightScreenCaptureAccess() ? "" : " Enable Screen Recording for Third Hand to read unlabeled screen text."
-                return StepOutcome(status: "blocked", detail: reason + permission + " Try a different step, such as scrolling or opening a menu.", elements: latest)
-            }
-            // A step with text must type it: a click on an editable field becomes entry into that field,
-            // and anything else is rejected rather than silently dropping the text.
-            if let text, decision.operation != "TYPE_TEXT" {
-                guard ["CLICK", "DOUBLE_CLICK"].contains(decision.operation), let targetID = decision.targetIndex,
-                      JevClient.targets(observation.elements)["TYPE_TEXT"]?[targetID] != nil else {
-                    return StepOutcome(status: "rejected", detail: "This step has text to enter, but no editable field was found for it (the selector chose \(decision.operation)). Name the field to type into.", elements: latest)
-                }
-                decision = AgentDecision(operation: "TYPE_TEXT", targetIndex: targetID, textValue: text)
-            }
-            if decision.operation == "TYPE_TEXT" {
-                guard let text else {
-                    return StepOutcome(status: "needs_text", detail: "This step targets an editable field. Call step again with the exact text to enter.", elements: latest)
-                }
-                guard !(target.isTerminal && terminalInputPending) else {
-                    return StepOutcome(status: "rejected", detail: "Terminal input was already entered and not submitted. Press Return to run it, or clear the line first.", elements: latest)
-                }
-                decision.textValue = text
             }
             phase = "validating_action"
             do { try decision.validate(elements: observation.elements, hasScreenshot: false) }
