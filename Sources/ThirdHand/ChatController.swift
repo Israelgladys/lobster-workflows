@@ -17,7 +17,7 @@ final class ChatController: ObservableObject, TaskRunnerDelegate {
 
     /// Supplies credentials at send time; nil means setup isn't finished.
     var credentials: () -> (apiKey: String, codex: CodexCredentials)? = { nil }
-    /// Called when a task ends, to bring the chat back in front.
+    /// Called when a task that used the screen ends, to bring the chat back in front.
     var onTaskFinished: () -> Void = {}
     var onSetupNeeded: () -> Void = {}
 
@@ -138,16 +138,25 @@ final class ChatController: ObservableObject, TaskRunnerDelegate {
         screenChoices[messageID] = choice
     }
 
-    /// Opens the app for the task. A background task in a Chromium app runs through its debugging
-    /// connection, relaunching the app first if the user agrees; other apps run on screen.
+    /// Opens the app for the task. A background task runs through a Chromium app's debugging connection
+    /// when it already has one, and otherwise with input addressed to the app's window. Where that input
+    /// isn't available, Chromium apps can be relaunched with debugging and other apps run on screen.
     private func launch(for job: Job) async throws -> (NSRunningApplication, background: Bool) {
-        guard job.mode == .background, ElectronDetector.supportsDebugging(bundleID: job.app.bundleID) else {
-            return (try await AppCatalog.prepare(job.app), false)
-        }
+        guard job.mode == .background else { return (try await AppCatalog.prepare(job.app), false) }
         let running = NSRunningApplication.runningApplications(withBundleIdentifier: job.app.bundleID).first { !$0.isTerminated }
-        if let running, await ElectronDetector.isReadyForBackground(pid: running.processIdentifier) {
+        if let running, ElectronDetector.supportsDebugging(bundleID: job.app.bundleID),
+           await ElectronDetector.isReadyForBackground(pid: running.processIdentifier) {
             // Background control talks to the page directly; reopening the window would bring the app forward.
             return (running, true)
+        }
+        if SkyLight.isAvailable {
+            let previous = NSWorkspace.shared.frontmostApplication
+            let app = try await AppCatalog.prepare(job.app)
+            Task { await BackgroundInput.keepBehind(app, restoring: previous) }
+            return (app, true)
+        }
+        guard ElectronDetector.supportsDebugging(bundleID: job.app.bundleID) else {
+            return (try await AppCatalog.prepare(job.app), false)
         }
         if running != nil {
             switch try await awaitChoice(for: job, prompt: .relaunch, status: "Needs a relaunch for background control") {
@@ -177,7 +186,7 @@ final class ChatController: ObservableObject, TaskRunnerDelegate {
         }
     }
 
-    /// Background mode in apps without background control: borrow the screen once the user is idle.
+    /// Background mode where background input is unavailable: borrow the screen once the user is idle.
     private func awaitIdle(for job: Job, steps: [PlanStep]) async throws {
         defer { screenChoices[job.messageID] = nil }
         store.updateMessage(job.messageID, in: job.threadID) { message in
@@ -223,7 +232,8 @@ final class ChatController: ObservableObject, TaskRunnerDelegate {
         }
         finish(threadID: current.job.threadID, messageID: current.job.messageID, state: state, text: text,
                seconds: Date().timeIntervalSince(current.started))
-        onTaskFinished()
+        // A task that ran on screen returns the user to the chat; a background one leaves them where they are.
+        if current.runner?.background != true { onTaskFinished() }
         startNext()
     }
 

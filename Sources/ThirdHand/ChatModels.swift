@@ -10,8 +10,8 @@ enum TaskState: String, Codable {
     case queued, running, waiting, done, failed, stopped
 }
 
-/// How a task may use the screen. Return sends on screen, ⇧Return in the background: Chromium apps
-/// run through a debugging connection, and other apps borrow the screen once the user is idle.
+/// How a task may use the screen. Return sends on screen, ⇧Return in the background: input goes to the
+/// app's window (or a Chromium app's debugging connection) without bringing it forward.
 enum ExecutionMode: String, Codable {
     case onScreen, background
 

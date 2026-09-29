@@ -17,7 +17,8 @@ final class TaskRunner: ActionLayer {
     let credentials: CodexCredentials
     /// Earlier turns in the chat thread, for follow-ups.
     let context: [String]
-    /// Drive the app through its debugging connection without bringing it forward.
+    /// Drive the app without bringing it forward: through its debugging connection when it has one,
+    /// otherwise with input addressed to its window.
     let background: Bool
     /// Returns once the task may take over the screen for these steps; throws to stop.
     var requestScreen: ([PlanStep]) async throws -> Void = { _ in }
@@ -38,6 +39,9 @@ final class TaskRunner: ActionLayer {
     private var timedOut = false
     nonisolated static let activeTimeLimit: TimeInterval = 300
     private var actions = 0
+    /// The user's front app and the time of the last input addressed to the target's window.
+    private var userApp: NSRunningApplication?
+    private var lastWindowInput = Date.distantPast
     private lazy var jev = JevClient(apiKey: apiKey)
 
     init(target: AppTarget, goal: String, apiKey: String, credentials: CodexCredentials, context: [String] = [],
@@ -115,10 +119,17 @@ final class TaskRunner: ActionLayer {
     private func runAgent() async throws {
         guard AXIsProcessTrusted() else { throw ControllerError.invalid("Enable Accessibility for Third Hand in System Settings.") }
         try checkFocus()
-        if background {
-            guard let port = await ElectronDetector.findDebugPort(pid: target.pid) else {
-                throw ControllerError.invalid("\(target.name) has no debugging connection, so it can't run in the background.")
+        let debugPort = background ? await ElectronDetector.findDebugPort(pid: target.pid) : nil
+        if background, debugPort == nil {
+            try BackgroundInput.ensureAvailable()
+            // A window that just opened may still be moving into place.
+            for _ in 0..<20 where WindowSnapshot.frontWindow(pid: target.pid) == nil {
+                try checkFocus()
+                try await Task.sleep(nanoseconds: 250_000_000)
             }
+            Log.info("Background control via=window_input")
+            watchForActivation()
+        } else if background, let port = debugPort {
             // Right after a relaunch the page is still loading and the window may still be settling.
             var lastError: Error?
             for attempt in 1...20 {
@@ -150,9 +161,9 @@ final class TaskRunner: ActionLayer {
         AXUIElementSetAttributeValue(target.appElement, "AXManualAccessibility" as CFString, kCFBooleanTrue)
         AXUIElementSetAttributeValue(target.appElement, "AXEnhancedUserInterface" as CFString, kCFBooleanTrue)
         var context = context
-        // Ultrafast works from the DOM for Chromium apps in the background and from the accessibility tree
-        // on screen; background tasks in other apps keep the planner's idle-wait flow.
-        if Self.ultrafastEnabled, !background || cdpClient != nil {
+        // Ultrafast works from the DOM for Chromium apps with a debugging connection and from the
+        // accessibility tree everywhere else, on screen or in the background.
+        if Self.ultrafastEnabled {
             phase = "fast"
             let fast = try await runFastLoop(task: goal)
             if fast.status == "verified" {
@@ -464,7 +475,7 @@ final class TaskRunner: ActionLayer {
             RunMetrics.current.action(fast: fastSettle)
             phase = "executing_\(decision.operation)"
             var executionError: String?
-            do { try await execute(decision, elements: observation.elements, windowFrame: observation.frame) }
+            do { try await execute(decision, elements: observation.elements, windowID: observation.windowID, windowFrame: observation.frame) }
             catch is CancellationError { throw CancellationError() }
             catch {
                 try checkFocus()
@@ -527,8 +538,8 @@ final class TaskRunner: ActionLayer {
     /// Adds on-device OCR once per task. Returns false when already used or not permitted.
     private func enableOCR(_ reason: String) -> Bool {
         phase = "recovery"
-        // OCR regions can only be clicked with the real mouse, which background control doesn't use.
-        guard !useOCR, !background, CGPreflightScreenCaptureAccess(), progress.beginRecovery() else {
+        // OCR regions are clicked by position, which the debugging connection can't address.
+        guard !useOCR, !(background && cdpClient != nil), CGPreflightScreenCaptureAccess(), progress.beginRecovery() else {
             Log.info("OCR recovery unavailable already_used=\(useOCR)")
             return false
         }
@@ -548,8 +559,8 @@ final class TaskRunner: ActionLayer {
     }
 
     private func isCurrent(_ observation: Observation) -> Bool {
-        // Background control addresses the page, not a window, which may be hidden or minimized.
-        if background { return true }
+        // The debugging connection addresses the page, not a window, which may be hidden or minimized.
+        if background && cdpClient != nil { return true }
         guard let window = WindowSnapshot.frontWindow(pid: target.pid) else { return false }
         return window.id == observation.windowID && window.frame == observation.frame
     }
@@ -557,8 +568,10 @@ final class TaskRunner: ActionLayer {
     private func observe() async throws -> Observation {
         try checkFocus()
         let visibleWindow = WindowSnapshot.frontWindow(pid: target.pid)
-        guard let window = visibleWindow ?? (background ? (id: 0, frame: .zero) : nil) else {
-            throw ControllerError.invalid("No visible target window")
+        guard let window = visibleWindow ?? (background && cdpClient != nil ? (id: 0, frame: .zero) : nil) else {
+            throw ControllerError.invalid(background
+                ? "\(target.name) has no open window on this desktop. Background control needs a window that isn't minimized or hidden."
+                : "No visible target window")
         }
         var elements: [AccessibilityElement] = []
         if let cdp = cdpClient {
@@ -571,7 +584,7 @@ final class TaskRunner: ActionLayer {
                 Log.info("Browser observation unavailable; using accessibility")
             }
         }
-        if elements.isEmpty && !background { elements = AXTreeWalker.walk(target: target) }
+        if elements.isEmpty && (!background || cdpClient == nil) { elements = AXTreeWalker.walk(target: target) }
         try checkFocus()
         if useOCR {
             let ocr = try await AsyncTimeout.run(seconds: 8, message: "Local screen reading timed out.") {
@@ -652,8 +665,100 @@ final class TaskRunner: ActionLayer {
         }
     }
 
-    private func execute(_ decision: AgentDecision, elements: [AccessibilityElement], windowFrame: CGRect?) async throws {
-        if background { return try await executeInBackground(decision) }
+    /// Some controls activate their app when used, even from the background (WebKit does on focus).
+    /// Hands the front back to the user's app when that follows an input; switching to the app later
+    /// is the user's choice and is left alone.
+    private func watchForActivation() {
+        Task { [weak self] in
+            while let self, self.active, !Task.isCancelled {
+                if NSWorkspace.shared.frontmostApplication?.processIdentifier == self.target.pid,
+                   Date().timeIntervalSince(self.lastWindowInput) < 1.5, let user = self.userApp {
+                    Log.info("Target took the front after input; restoring the user's app")
+                    user.activate()
+                }
+                try? await Task.sleep(nanoseconds: 100_000_000)
+            }
+        }
+    }
+
+    /// Background input for apps without a debugging connection: accessibility actions first, then
+    /// events addressed to the target window. The user's pointer, front app and key window stay put.
+    private func executeInWindow(_ decision: AgentDecision, elements: [AccessibilityElement],
+                                 windowID: CGWindowID, windowFrame: CGRect?) async throws {
+        let element = elements.first { String($0.id) == decision.targetIndex }
+        let point = element?.screenFrame().map { CGPoint(x: $0.midX, y: $0.midY) }
+        func click(count: Int = 1, right: Bool = false) throws {
+            guard let point else { throw ControllerError.invalid("The selected control did not expose a clickable position.") }
+            guard let windowFrame, windowFrame.contains(point) else { throw ControllerError.invalid("Target is outside the current window") }
+            try BackgroundInput.click(pid: target.pid, window: windowID, at: point, count: count, right: right)
+        }
+        func focusedElement() -> AXUIElement? {
+            var value: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(target.appElement, kAXFocusedUIElementAttribute as CFString, &value) == .success,
+                  let value, CFGetTypeID(value) == AXUIElementGetTypeID() else { return nil }
+            return (value as! AXUIElement)
+        }
+        if let front = NSWorkspace.shared.frontmostApplication, front.processIdentifier != target.pid { userApp = front }
+        lastWindowInput = Date()
+        defer { lastWindowInput = Date() }
+        try checkFocus()
+        switch decision.operation {
+        case "CLICK", "CLICK_TEXT":
+            if let element, let ax = element.axElement {
+                for action in ["AXPress", "AXOpen", "AXConfirm", "AXPick"] where element.actions.contains(action) {
+                    if AXUIElementPerformAction(ax, action as CFString) == .success { return }
+                }
+            }
+            try click()
+        case "DOUBLE_CLICK": try click(count: 2)
+        case "RIGHT_CLICK": try click(right: true)
+        case "TYPE_TEXT":
+            guard let text = decision.textValue else { throw ControllerError.invalid("Missing text") }
+            guard let element, let ax = element.axElement else { throw ControllerError.invalid("No editable field was selected.") }
+            phase = "confirming_field_focus"
+            // Focus by clicking: setting AXFocused activates some apps (Safari does).
+            try await TextFieldFocus.prepare(check: checkFocus, probe: { TextFieldFocus.confirmed(ax, app: self.target.appElement) },
+                                             requestFocus: { try click() }, click: { try click() })
+            if target.isTerminal {
+                // Readline-style editing for a shell prompt.
+                try BackgroundInput.press(pid: target.pid, window: windowID, key: "a", modifiers: ["control"])
+                try BackgroundInput.press(pid: target.pid, window: windowID, key: "k", modifiers: ["control"])
+            } else if !(element.value ?? "").isEmpty, !BackgroundInput.selectAll(in: focusedElement() ?? ax) {
+                throw ControllerError.invalid("The field's existing text couldn't be selected in the background. No text was entered.")
+            }
+            phase = "typing_text"
+            try await BackgroundInput.type(pid: target.pid, window: windowID, text: text) {
+                try self.checkFocus()
+                guard TextFieldFocus.confirmed(ax, app: self.target.appElement) else { throw TextFieldFocus.Failure.changed }
+            }
+            if target.isTerminal { terminalInputPending = true }
+        case "KEY_PRESS":
+            let key = decision.key!, modifiers = decision.modifiers ?? []
+            // Menu key equivalents only reach the front app, so ⌘ shortcuts go through the menu when one
+            // matches. Others, like ⌘↓ in a text view, are ordinary keys the window handles itself.
+            let command = modifiers.contains("command")
+            if command, key.lowercased() == "a", modifiers == ["command"], let field = focusedElement(), BackgroundInput.selectAll(in: field) {
+                Log.info("Background shortcut via=select_all")
+            } else if command, BackgroundInput.menuShortcut(app: target.appElement, key: key, modifiers: modifiers) {
+                Log.info("Background shortcut via=menu")
+            } else {
+                try BackgroundInput.press(pid: target.pid, window: windowID, key: key, modifiers: modifiers)
+            }
+            terminalInputPending = false
+        case "SCROLL_UP", "SCROLL_DOWN":
+            guard let frame = windowFrame else { throw ControllerError.invalid("No window to scroll") }
+            try BackgroundInput.scroll(pid: target.pid, window: windowID, at: point ?? CGPoint(x: frame.midX, y: frame.midY),
+                                       lines: decision.operation == "SCROLL_UP" ? 5 : -5)
+        case "WAIT": try await Task.sleep(nanoseconds: 700_000_000)
+        default: throw ControllerError.invalid("Unsupported operation")
+        }
+    }
+
+    private func execute(_ decision: AgentDecision, elements: [AccessibilityElement], windowID: CGWindowID, windowFrame: CGRect?) async throws {
+        if background {
+            if cdpClient != nil { return try await executeInBackground(decision) }
+            return try await executeInWindow(decision, elements: elements, windowID: windowID, windowFrame: windowFrame)
+        }
         let element = elements.first { String($0.id) == decision.targetIndex }
         let point: CGPoint?
         if let element, let frame = element.screenFrame() {
