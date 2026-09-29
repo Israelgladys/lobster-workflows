@@ -119,17 +119,16 @@ final class TaskRunner: ActionLayer {
             var lastError: Error?
             for attempt in 1...20 {
                 try checkFocus()
-                if let window = WindowSnapshot.frontWindow(pid: target.pid) {
-                    let cdp = CDPClient(port: port)
-                    do {
-                        try await cdp.connect(windowFrame: window.frame, requireFocus: false)
-                        cdpClient = cdp
-                        Log.info("Background connection ready attempt=\(attempt)")
-                        break
-                    } catch {
-                        cdp.disconnect()
-                        lastError = error
-                    }
+                // The window may be hidden or minimized; the page is still reachable.
+                let cdp = CDPClient(port: port)
+                do {
+                    try await cdp.connect(windowFrame: nil, requireFocus: false)
+                    cdpClient = cdp
+                    Log.info("Background connection ready attempt=\(attempt)")
+                    break
+                } catch {
+                    cdp.disconnect()
+                    lastError = error
                 }
                 try await Task.sleep(nanoseconds: 500_000_000)
             }
@@ -195,8 +194,12 @@ final class TaskRunner: ActionLayer {
         }
         if !background { try await bringToFront() }
         var latest: [AccessibilityElement] = []
-        // Separate observation budget bounds stale-window retries and recovery within a step.
-        for _ in 0..<4 {
+        // A planned target may not be on screen yet (results loading, a menu opening): keep looking while
+        // the screen is still changing, up to a few seconds, before asking Jev or the planner.
+        let appearDeadline = Date().addingTimeInterval(3)
+        var previousSignature: String?
+        // Separate observation budget bounds waiting, stale-window retries, and recovery within a step.
+        for _ in 0..<14 {
             try checkFocus()
             delegate?.taskRunner(self, status: "Finding the control… (\(actions)/\(maxSteps))")
             phase = "observing"
@@ -219,22 +222,46 @@ final class TaskRunner: ActionLayer {
                 let label = step.target ?? ""
                 let candidates = pool(for: step.action, in: observation.elements)
                 let matches = StepMatcher.exact(target: label, role: step.role, near: step.near, in: candidates)
+                let signature = ObservationState.signature(observation.elements)
+                defer { previousSignature = signature }
+                if matches.isEmpty, Date() < appearDeadline, signature != previousSignature {
+                    phase = "awaiting_target"
+                    try await Task.sleep(nanoseconds: 350_000_000)
+                    continue
+                }
+                if step.near != nil {
+                    let unnarrowed = StepMatcher.exact(target: label, role: step.role, in: candidates).count
+                    Log.info("Grounding near=provided matches_before=\(unnarrowed) matches_after=\(matches.count)")
+                }
                 var chosen: AccessibilityElement?
+                // Planned targets for screens that didn't exist yet are the text the planner expected to see;
+                // the real control often wraps it ("Play Skyfall by Adele", or a row). Match by containment first.
+                let containing = matches.isEmpty ? StepMatcher.containing(target: label, near: step.near, in: candidates) : []
                 if matches.count == 1 {
                     chosen = matches[0]
                     Log.info("Grounded via=exact action=\(step.action)")
+                } else if containing.count == 1 {
+                    chosen = containing[0]
+                    Log.info("Grounded via=contains action=\(step.action)")
                 } else if !candidates.isEmpty {
                     phase = "grounding"
                     do {
                         chosen = try await jev.ground(action: step.action, target: label, role: step.role, near: step.near,
-                                                      candidates: matches.count > 1 ? matches : candidates, appName: target.name)
+                                                      candidates: matches.count > 1 ? matches : containing.count > 1 ? containing : candidates,
+                                                      allExact: matches.count > 1, appName: target.name)
                     } catch is CancellationError { throw CancellationError() }
                     catch let error as JevServiceError { throw error }
                     catch {
                         try checkFocus()
                         return StepOutcome(status: "blocked", detail: "The action selector failed: \(error.localizedDescription)", elements: latest)
                     }
-                    Log.info("Grounded via=jev action=\(step.action) duplicates=\(matches.count) found=\(chosen != nil)")
+                    Log.info("Grounded via=jev action=\(step.action) duplicates=\(matches.count) containing=\(containing.count) found=\(chosen != nil)")
+                    // Identical controls with no hint to tell them apart: the planner asked for exactly this
+                    // label, so take the first in reading order (usually the top result).
+                    if chosen == nil, matches.count > 1, step.near == nil {
+                        chosen = matches[0]
+                        Log.info("Grounded via=first_duplicate action=\(step.action)")
+                    }
                 }
                 guard let chosen else {
                     let reason = "No \(step.action == "type" ? "editable field" : "clickable control") labelled \"\(label)\" is on screen."
@@ -379,13 +406,18 @@ final class TaskRunner: ActionLayer {
     }
 
     private func isCurrent(_ observation: Observation) -> Bool {
+        // Background control addresses the page, not a window, which may be hidden or minimized.
+        if background { return true }
         guard let window = WindowSnapshot.frontWindow(pid: target.pid) else { return false }
         return window.id == observation.windowID && window.frame == observation.frame
     }
 
     private func observe() async throws -> Observation {
         try checkFocus()
-        guard let window = WindowSnapshot.frontWindow(pid: target.pid) else { throw ControllerError.invalid("No visible target window") }
+        let visibleWindow = WindowSnapshot.frontWindow(pid: target.pid)
+        guard let window = visibleWindow ?? (background ? (id: 0, frame: .zero) : nil) else {
+            throw ControllerError.invalid("No visible target window")
+        }
         var elements: [AccessibilityElement] = []
         if let cdp = cdpClient {
             do { elements = try await cdp.extractElements() }
@@ -418,7 +450,10 @@ final class TaskRunner: ActionLayer {
         // A page can say when it stops changing, instead of polling the screen for a second or more.
         if let cdp = cdpClient, background || cdp.isConnected {
             do {
-                let changed = try await cdp.waitForQuiet()
+                // Typing redraws immediately; Return and clicks may navigate and load results.
+                let navigates = decision.operation != "TYPE_TEXT"
+                let changed = try await cdp.waitForQuiet(firstChangeMs: navigates ? 1000 : 600,
+                                                         quietMs: navigates ? 350 : 150, maxMs: navigates ? 3000 : 1500)
                 let latest = try await observe()
                 Log.info("Settle via=dom changed=\(changed)")
                 return latest

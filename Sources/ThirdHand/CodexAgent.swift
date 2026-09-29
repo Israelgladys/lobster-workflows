@@ -68,27 +68,29 @@ final class CodexAgent {
     You are Third Hand, a macOS assistant that completes tasks in the app the user has focused. \
     You cannot see pixels; you receive the app window's accessibility controls and on-device OCR text.
 
-    Call `act` with the full sequence of steps. Each step is exactly one action:
-    - click: `target` is the control's label copied exactly from the screen list, `role` its role from the list \
-    (e.g. button, row, checkBox).
-    - type: `target` is the field's label copied exactly from the screen, `role` its role, `text` the exact text. \
-    Typing focuses the field and replaces its entire contents, so never add steps to click, clear, or select a \
-    field first.
+    Call `act` once with every step needed to finish the task, including steps on screens that will only appear \
+    after earlier steps (search results, menus, dialogs). Each step is exactly one action:
+    - click: `target` is the control's label, `role` its role (e.g. button, row, checkBox). For controls on the \
+    current screen, copy the label exactly from the screen list. For controls that will appear later, use the \
+    text you expect them to show, such as a song or item title, and set `near` to other text you expect beside \
+    it, such as the artist.
+    - type: `target` is the field's label, `role` its role, `text` the exact text. Typing focuses the field and \
+    replaces its entire contents, so never add steps to click, clear, or select a field first.
     - press: `key` such as return, escape, tab, space, down, or a shortcut like command+f.
     - scroll: `direction` up or down; `target` optionally names the list or area to scroll.
-    - wait: let content load.
+    - wait: only when nothing on screen will change to show that loading finished.
     - near: when several controls share a label (e.g. many "Play" buttons), set `near` to text from the \
     target's "in …" context in the screen list, such as the song title; otherwise null.
-    Set every field a step doesn't use to null. Only use labels that appear in the screen list; to reach a control \
-    that isn't listed yet, end the plan after the step that reveals it and set `finishes_task` to false. \
+    Set every field a step doesn't use to null. Each step automatically waits a few seconds for its target to \
+    appear and a fast selector finds it on the new screen, so don't add wait steps between actions. \
     You write all text yourself: search keywords, messages, commands, and form values. \
     Use the fewest steps: a search is usually type, then press return.
 
-    Steps run in order and stop at the first one that fails. Set `finishes_task` to true whenever these steps by \
-    themselves accomplish the request, as with searching, opening, playing, toggling, or typing and sending: \
-    when every step succeeds the task ends without asking you again, and `summary` describes the result. \
-    Set it to false only when you must read content that appears after these steps to choose what to do next, \
-    for example picking a specific search result you can't see yet; `summary` then says what you'll check. \
+    Steps run in order and stop at the first one that fails. Set `finishes_task` to true whenever these steps \
+    accomplish the request, as with searching, opening, playing, toggling, or typing and sending, even when later \
+    steps target things that aren't on screen yet: when every step succeeds the task ends without asking you \
+    again, and `summary` describes the result. Set it to false only when the next choice depends on content you \
+    can't predict, such as reading an email before replying; `summary` then says what you'll check. \
     If a step fails you get the per-step results and the current screen; plan again from there and change \
     strategy rather than repeating a failed step. Never retype text the screen shows is already entered.
 
@@ -133,6 +135,9 @@ final class CodexAgent {
     /// amount of other text. Unlabelled elements (which it couldn't name) and exact duplicates are dropped.
     nonisolated static func describe(_ elements: [AccessibilityElement]) -> String {
         let actionable = Set(JevClient.targets(elements).values.flatMap(\.keys))
+        // Context only helps where a label repeats; elsewhere it doubles the planner's input.
+        var labelCounts: [String: Int] = [:]
+        for element in elements { labelCounts[element.displayRole + "|" + element.displayLabel, default: 0] += 1 }
         var lines: [String] = []
         var seen: Set<String> = []
         var used = 0
@@ -149,7 +154,9 @@ final class CodexAgent {
             if element.focused { line += " [focused]" }
             if !element.enabled { line += " [disabled]" }
             if element.source == "ocr" { line += " (ocr text)" }
-            if let context = element.context { line += " in \"\(context.prefix(80))\"" }
+            if let context = element.context, labelCounts[element.displayRole + "|" + element.displayLabel, default: 0] > 1 {
+                line += " in \"\(context.prefix(80))\""
+            }
             guard seen.insert(line).inserted else { continue }
             guard used + line.count <= maxScreenCharacters else { omitted += elements.count - lines.count; break }
             used += line.count + 1

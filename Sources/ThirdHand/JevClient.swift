@@ -77,7 +77,7 @@ final class JevClient {
     }
 
     nonisolated static func groundRequest(action: String, target: String, role: String?, near: String? = nil,
-                                          candidates: [AccessibilityElement],
+                                          candidates: [AccessibilityElement], allExact: Bool = false,
                                           appName: String) throws -> (data: Data, offered: [String: AccessibilityElement]) {
         var selected = shortlist(candidates, target: (near.map { target + " " + $0 }) ?? target, role: role)
         let verb = action == "type" ? "type into" : "click"
@@ -99,7 +99,9 @@ final class JevClient {
                 "state": ["app": String(appName.prefix(100)), "action": action, "target": target, "role": role ?? "", "near": near ?? ""],
                 "questions": ["target": [
                     "type": "choice", "criteria": criteria,
-                    "instructions": "The planner wants to \(verb) \(described). Which element is it? Labels may differ slightly in wording, case, or truncation. OCR text is only valid when it names that control. Choose none if no element plausibly is it."
+                    "instructions": allExact
+                        ? "The planner wants to \(verb) \(described). Every element below has exactly that label; they differ only by where they are. Choose the one whose context best fits. Choose none only if the context clearly rules out all of them."
+                        : "The planner wants to \(verb) \(described). Which element is it? Labels may differ slightly in wording, case, or truncation. OCR text is only valid when it names that control. Choose none if no element plausibly is it."
                 ] as [String: Any]]
             ]
             let data = try JSONSerialization.data(withJSONObject: body)
@@ -125,9 +127,9 @@ final class JevClient {
 
     /// The element a step's label refers to among action-compatible candidates, or nil when none matches.
     func ground(action: String, target: String, role: String?, near: String? = nil, candidates: [AccessibilityElement],
-                appName: String) async throws -> AccessibilityElement? {
+                allExact: Bool = false, appName: String) async throws -> AccessibilityElement? {
         let prepared = try Self.groundRequest(action: action, target: target, role: role, near: near,
-                                              candidates: candidates, appName: appName)
+                                              candidates: candidates, allExact: allExact, appName: appName)
         var request = URLRequest(url: endpoint, timeoutInterval: 15)
         request.httpMethod = "POST"
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")

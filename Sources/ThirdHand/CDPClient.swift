@@ -17,7 +17,8 @@ final class CDPClient {
         self.session = session
     }
 
-    func connect(windowFrame: CGRect, requireFocus: Bool = true) async throws {
+    /// `windowFrame` nil skips matching the page to a visible window (background control of a hidden window).
+    func connect(windowFrame: CGRect?, requireFocus: Bool = true) async throws {
         struct Target: Decodable {
             let id: String
             let type: String
@@ -70,11 +71,11 @@ final class CDPClient {
             throw ControllerError.invalid("CDP DOM extraction returned no data")
         }
         let snapshot = try JSONDecoder().decode(DOMSnapshot.self, from: data)
-        guard let expectedFrame, snapshot.screen.focused || !requireFocus,
-              abs(snapshot.screen.x - expectedFrame.minX) < 8,
-              abs(snapshot.screen.y - expectedFrame.minY) < 8,
-              abs(snapshot.screen.width - expectedFrame.width) < 8,
-              abs(snapshot.screen.height - expectedFrame.height) < 8 else {
+        let matchesWindow = expectedFrame.map { frame in
+            abs(snapshot.screen.x - frame.minX) < 8 && abs(snapshot.screen.y - frame.minY) < 8
+                && abs(snapshot.screen.width - frame.width) < 8 && abs(snapshot.screen.height - frame.height) < 8
+        } ?? !requireFocus
+        guard snapshot.screen.focused || !requireFocus, matchesWindow else {
             throw ControllerError.invalid("Browser page does not match the focused app window")
         }
         let originX = snapshot.screen.x
@@ -103,20 +104,26 @@ final class CDPClient {
         }
     }
 
-    /// Resolves once the page stops changing: after the first DOM change within `firstChangeMs`,
-    /// it waits for `quietMs` without changes, up to `maxMs`. Returns false if nothing changed.
+    /// Resolves once the page stops changing: after the first DOM change or finished network request
+    /// within `firstChangeMs`, it waits for `quietMs` without either, up to `maxMs`. Returns false if nothing changed.
     func waitForQuiet(firstChangeMs: Int = 800, quietMs: Int = 150, maxMs: Int = 2000) async throws -> Bool {
         let result = try await send(method: "Runtime.evaluate", params: [
             "expression": """
             new Promise(resolve => {
-                let changed = false, quietTimer = null;
-                const done = value => { observer.disconnect(); clearTimeout(firstTimer); clearTimeout(maxTimer); clearTimeout(quietTimer); resolve(value); };
-                const observer = new MutationObserver(() => {
+                let changed = false, quietTimer = null, network = null;
+                const done = value => {
+                    observer.disconnect(); if (network) network.disconnect();
+                    clearTimeout(firstTimer); clearTimeout(maxTimer); clearTimeout(quietTimer); resolve(value);
+                };
+                const activity = () => {
                     changed = true;
                     clearTimeout(quietTimer);
                     quietTimer = setTimeout(() => done(true), \(quietMs));
-                });
+                };
+                const observer = new MutationObserver(activity);
                 observer.observe(document, {subtree: true, childList: true, attributes: true, characterData: true});
+                // Results often arrive over the network after a loading skeleton; finished requests count as activity.
+                try { network = new PerformanceObserver(activity); network.observe({type: 'resource'}); } catch (e) {}
                 const firstTimer = setTimeout(() => { if (!changed) done(false); }, \(firstChangeMs));
                 const maxTimer = setTimeout(() => done(changed), \(maxMs));
             })

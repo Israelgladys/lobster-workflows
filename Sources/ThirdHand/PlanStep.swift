@@ -74,6 +74,21 @@ struct PlanStep: Equatable {
 }
 
 enum StepMatcher {
+    nonisolated static func words(_ text: String) -> [String] {
+        text.lowercased().split(whereSeparator: { !$0.isLetter && !$0.isNumber }).map(String.init)
+    }
+
+    /// Controls whose label or row text contains every word of the target (and of `near`, when given).
+    /// Field values are ignored, so a search box holding the query never matches its own results.
+    nonisolated static func containing(target: String, near: String?, in pool: [AccessibilityElement]) -> [AccessibilityElement] {
+        let wanted = words(target) + words(near ?? "")
+        guard !words(target).isEmpty else { return [] }
+        return pool.filter { element in
+            let text = Set(words((element.label ?? "") + " " + (element.context ?? "")))
+            return wanted.allSatisfy(text.contains)
+        }
+    }
+
     nonisolated static func normalize(_ text: String) -> String {
         text.lowercased().split(whereSeparator: \.isWhitespace).joined(separator: " ")
     }

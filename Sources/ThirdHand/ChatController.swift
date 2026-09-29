@@ -146,7 +146,8 @@ final class ChatController: ObservableObject, TaskRunnerDelegate {
         }
         let running = NSRunningApplication.runningApplications(withBundleIdentifier: job.app.bundleID).first { !$0.isTerminated }
         if let running, await ElectronDetector.isReadyForBackground(pid: running.processIdentifier) {
-            return (try await AppCatalog.prepare(job.app), true)
+            // Background control talks to the page directly; reopening the window would bring the app forward.
+            return (running, true)
         }
         if running != nil {
             switch try await awaitChoice(for: job, prompt: .relaunch, status: "Needs a relaunch for background control") {

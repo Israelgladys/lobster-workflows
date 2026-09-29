@@ -169,6 +169,33 @@ final class PlanStepTests: XCTestCase {
         XCTAssertEqual(screen.components(separatedBy: "\n").count, 2, "Context keeps duplicates distinct")
     }
 
+    func testContextOnlyForRepeatedLabels() {
+        var unique = control(3, "AXButton", "Shuffle"); unique.context = "Now playing bar"
+        XCTAssertFalse(CodexAgent.describe([unique]).contains(" in \""), "A unique label needs no context")
+    }
+
+    func testIdenticalLabelsAskJevToPickNotReject() throws {
+        var a = control(1, "AXButton", "Play"); a.context = "Hello · Adele"
+        var b = control(2, "AXButton", "Play"); b.context = "Skyfall · Adele"
+        let prepared = try JevClient.groundRequest(action: "click", target: "Play", role: "button", candidates: [a, b],
+                                                   allExact: true, appName: "Spotify")
+        let body = try JSONSerialization.jsonObject(with: prepared.data) as! [String: Any]
+        let instructions = ((body["questions"] as! [String: [String: Any]])["target"]!["instructions"]) as! String
+        XCTAssertTrue(instructions.contains("Every element below has exactly that label"))
+    }
+
+    func testContainmentFindsPlannedTargetsOnNewScreens() {
+        var row = control(1, "AXRow", "Skyfall"); row.context = "Skyfall Adele 4:46"
+        let play = control(2, "AXButton", "Play Skyfall by Adele")
+        let other = control(3, "AXButton", "Play Hello by Adele")
+        let search = control(4, "AXTextField", "What do you want to play?", value: "Skyfall Adele")
+        XCTAssertEqual(StepMatcher.containing(target: "Play Skyfall", near: "Adele", in: [row, play, other, search]).map(\.id), [2])
+        XCTAssertEqual(StepMatcher.containing(target: "Skyfall", near: "Adele", in: [row, play, other, search]).map(\.id), [1, 2],
+                       "Several containing matches go to Jev as a short list")
+        XCTAssertTrue(StepMatcher.containing(target: "Skyfall", near: nil, in: [search]).isEmpty, "A field's typed value isn't its label")
+        XCTAssertTrue(StepMatcher.containing(target: "", near: "Adele", in: [row]).isEmpty)
+    }
+
     func testFieldMatchesByLabelEvenWhenItShowsAValue() {
         let field = control(1, "AXTextField", "Search", value: "Frank Ocean")
         XCTAssertEqual(StepMatcher.exact(target: "Search", role: "textField", in: [field]).map(\.id), [1])
