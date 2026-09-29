@@ -56,9 +56,14 @@ final class CodexClient {
 
     nonisolated static func requestBody(model: String, instructions: String, input: [[String: Any]],
                                         tools: [[String: Any]], effort: String) -> [String: Any] {
-        ["model": model, "instructions": instructions, "input": input, "tools": tools,
-         "tool_choice": "auto", "parallel_tool_calls": false, "store": false, "stream": true,
-         "reasoning": ["effort": effort], "include": ["reasoning.encrypted_content"]]
+        var body: [String: Any] = ["model": model, "instructions": instructions, "input": input, "store": false, "stream": true,
+                                   "reasoning": ["effort": effort], "include": ["reasoning.encrypted_content"]]
+        if !tools.isEmpty {
+            body["tools"] = tools
+            body["tool_choice"] = "auto"
+            body["parallel_tool_calls"] = false
+        }
+        return body
     }
 
     func respond(model: String, instructions: String, input: [[String: Any]], tools: [[String: Any]],
@@ -123,6 +128,23 @@ final class CodexClient {
         RunMetrics.current.codex(ms: ms)
         Log.info("Timing codex_ms=\(ms) calls=\(response.functionCalls.count)")
         return response
+    }
+
+    /// Writes only the text for one field, for the ultrafast loop: no tools, no reasoning, a tiny prompt.
+    func writeText(task: String, field: AccessibilityElement, appName: String) async throws -> String {
+        var fieldLine = "\(field.displayRole) \"\(field.displayLabel.prefix(120))\""
+        if let value = field.value, !value.isEmpty, value != field.label { fieldLine += ", currently \"\(value.prefix(120))\"" }
+        let input = [CodexAgent.userMessage("Task: \(task)\nApp: \(appName)\nField: \(fieldLine)")]
+        let response = try await respond(model: Self.strongModel,
+            instructions: "Write the exact text a UI agent should type into this field to accomplish the task: search keywords, a message, or a form value. Reply with only JSON {\"text\": \"...\"}.",
+            input: input, tools: [], effort: "none")
+        let reply = response.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let start = reply.firstIndex(of: "{"), let end = reply.lastIndex(of: "}"),
+              let json = try? JSONSerialization.jsonObject(with: Data(reply[start...end].utf8)) as? [String: Any],
+              let text = json["text"] as? String, !text.isEmpty, text.utf16.count <= 12000, !text.contains("\0") else {
+            throw ControllerError.invalid("Couldn't write text for the field.")
+        }
+        return text
     }
 
     nonisolated static func event(fromLine line: String) -> [String: Any]? {

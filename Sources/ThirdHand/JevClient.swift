@@ -137,86 +137,103 @@ final class JevClient {
         return try Self.decodeGround(data, offered: prepared.offered)
     }
 
-    // MARK: - Goals
+    // MARK: - Next action (ultrafast loop)
 
-    struct GoalDecision {
+    struct NextAction {
         let done: Double
-        /// CLICK, SCROLL_DOWN, SCROLL_UP, PRESS_RETURN, PRESS_ESCAPE, WAIT, DONE, or STUCK.
+        /// CLICK, TYPE_TEXT, SCROLL_DOWN, SCROLL_UP, PRESS_RETURN, PRESS_ESCAPE, WAIT, DONE, or BLOCKED.
         let operation: String
         let target: AccessibilityElement?
     }
 
-    nonisolated static let goalDoneThreshold = 0.7
-    nonisolated static let goalScreenCharacters = 9_000
+    nonisolated static let doneThreshold = 0.7
+    nonisolated static let loopScreenCharacters = 9_000
 
-    /// One call answers whether the goal is met, the next action, and its click target.
-    nonisolated static func goalRequest(goal: String, elements: [AccessibilityElement], appName: String,
-                                        history: [String]) throws -> (data: Data, offered: [String: AccessibilityElement]) {
-        let clickable = JevClient.targets(elements)
-        let ids = Set((clickable["CLICK"] ?? [:]).keys).union((clickable["CLICK_TEXT"] ?? [:]).keys)
-        let pool = elements.filter { ids.contains(String($0.id)) }
-        var selected = shortlist(pool, target: goal, role: nil)
+    /// One request answers whether the task is done, the next operation, and a speculative target for each
+    /// operation that needs one, so deciding what and where costs a single round trip.
+    nonisolated static func nextActionRequest(task: String, elements: [AccessibilityElement], appName: String,
+                                              history: [String]) throws -> (data: Data, offered: [String: [String: AccessibilityElement]]) {
+        let compatible = JevClient.targets(elements)
+        func pool(_ keys: [String]) -> [AccessibilityElement] {
+            let ids = Set(keys.flatMap { (compatible[$0] ?? [:]).keys })
+            return elements.filter { ids.contains(String($0.id)) }
+        }
+        var clicks = shortlist(pool(["CLICK", "CLICK_TEXT"]), target: task, role: nil)
+        var fields = shortlist(pool(["TYPE_TEXT"]), target: task, role: nil)
         var screen = CodexAgent.describe(elements)
-        if screen.count > goalScreenCharacters { screen = String(screen.prefix(goalScreenCharacters)) + "\n- …" }
-        let operations: [String: String] = [
-            "CLICK": "Click a control that moves toward the goal",
-            "SCROLL_DOWN": "Reveal more content below",
-            "SCROLL_UP": "Reveal content above",
-            "PRESS_RETURN": "Confirm or open the focused or selected item",
-            "PRESS_ESCAPE": "Dismiss a popup, menu, or dialog that is in the way",
-            "WAIT": "Content is still loading",
-            "DONE": "The goal is visibly complete on screen",
-            "STUCK": "Nothing on screen can advance the goal"
-        ]
+        if screen.count > loopScreenCharacters { screen = String(screen.prefix(loopScreenCharacters)) + "\n- …" }
+        func describe(_ element: AccessibilityElement) -> String {
+            var desc = String(element.displayLabel.prefix(120))
+            if let value = element.value, !value.isEmpty, value != element.label { desc += " = \(value.prefix(80))" }
+            desc += " [\(element.displayRole)]"
+            if let context = element.context { desc += " — in \"\(context.prefix(80))\"" }
+            return desc
+        }
         while true {
-            var criteria: [String: String] = [:]
-            for element in selected {
-                var desc = String(element.displayLabel.prefix(120))
-                if let value = element.value, !value.isEmpty, value != element.label { desc += " = \(value.prefix(80))" }
-                desc += " [\(element.displayRole)]"
-                if let context = element.context { desc += " — in \"\(context.prefix(80))\"" }
-                criteria[String(element.id)] = desc
+            var operations: [String: String] = [
+                "SCROLL_DOWN": "Reveal more content below",
+                "SCROLL_UP": "Reveal content above",
+                "PRESS_RETURN": "Submit the focused field or open the selected item",
+                "PRESS_ESCAPE": "Dismiss a popup, menu, or dialog that is in the way",
+                "WAIT": "Content is still loading",
+                "DONE": "The task is visibly complete on screen",
+                "BLOCKED": "Nothing on screen can advance the task"
+            ]
+            var questions: [String: Any] = [
+                "done": ["type": "noul", "instructions": "Is this task visibly complete on the screen right now: \"\(task)\"? Judge only by the screen."] as [String: Any]
+            ]
+            if !clicks.isEmpty {
+                operations["CLICK"] = "Click a control that advances the task"
+                var criteria = Dictionary(uniqueKeysWithValues: clicks.map { (String($0.id), describe($0)) })
+                criteria[noneKey] = "None of these"
+                questions["click_target"] = ["type": "choice", "criteria": criteria,
+                                             "instructions": "If clicking, which control advances \"\(task)\"?"] as [String: Any]
             }
-            criteria[noneKey] = "None of these"
+            if !fields.isEmpty {
+                operations["TYPE_TEXT"] = "Enter text in an editable field (the text is written separately)"
+                var criteria = Dictionary(uniqueKeysWithValues: fields.map { (String($0.id), describe($0)) })
+                criteria[noneKey] = "None of these"
+                questions["type_text_target"] = ["type": "choice", "criteria": criteria,
+                                                 "instructions": "If typing, which field should receive text for \"\(task)\"?"] as [String: Any]
+            }
+            questions["operation"] = ["type": "choice", "criteria": operations,
+                                      "instructions": "Which single operation advances \"\(task)\" from this screen? Don't repeat an action that had no effect or retype text a field already shows."] as [String: Any]
             let body: [String: Any] = [
                 "model": "jev-latest",
-                "state": ["goal": goal, "app": String(appName.prefix(100)), "screen": screen,
-                          "actions_so_far": history.isEmpty ? ["none"] : Array(history.suffix(6))],
-                "questions": [
-                    "done": ["type": "noul", "instructions": "Is this goal visibly complete on the screen right now: \"\(goal)\"? Judge only by the screen."] as [String: Any],
-                    "operation": ["type": "choice", "criteria": operations,
-                                  "instructions": "Which single action moves toward \"\(goal)\"? Don't repeat an action that had no effect."] as [String: Any],
-                    "click_target": ["type": "choice", "criteria": criteria,
-                                     "instructions": "If clicking, which control should be clicked next to reach \"\(goal)\"?"] as [String: Any]
-                ] as [String: Any]
+                "state": ["task": task, "app": String(appName.prefix(100)), "screen": screen,
+                          "actions_so_far": history.isEmpty ? ["none"] : Array(history.suffix(8))],
+                "questions": questions
             ]
             let data = try JSONSerialization.data(withJSONObject: body)
             if data.count <= maxRequestBytes {
-                return (data, Dictionary(uniqueKeysWithValues: selected.map { (String($0.id), $0) }))
+                return (data, ["CLICK": Dictionary(uniqueKeysWithValues: clicks.map { (String($0.id), $0) }),
+                               "TYPE_TEXT": Dictionary(uniqueKeysWithValues: fields.map { (String($0.id), $0) })])
             }
-            if selected.count > 20 { selected = Array(selected.prefix(selected.count / 2)) }
+            if clicks.count > 20 { clicks = Array(clicks.prefix(clicks.count / 2)) }
+            else if fields.count > 10 { fields = Array(fields.prefix(fields.count / 2)) }
             else if screen.count > 1000 { screen = String(screen.prefix(screen.count / 2)) }
-            else { throw ControllerError.invalid("The screen is too large for the goal selector.") }
+            else { throw ControllerError.invalid("The screen is too large for the action selector.") }
         }
     }
 
-    nonisolated static func decodeGoal(_ data: Data, offered: [String: AccessibilityElement]) throws -> GoalDecision {
+    nonisolated static func decodeNextAction(_ data: Data, offered: [String: [String: AccessibilityElement]]) throws -> NextAction {
         guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               let answers = json["answers"] as? [String: Any],
               let operation = (answers["operation"] as? [String: Any])?["choice"] as? String else {
-            throw ControllerError.invalid("Invalid Jev goal response")
+            throw ControllerError.invalid("Invalid Jev response")
         }
         let done = ((answers["done"] as? [String: Any])?["noul"] as? Double) ?? 0
-        guard operation == "CLICK" else { return GoalDecision(done: done, operation: operation, target: nil) }
-        let choice = (answers["click_target"] as? [String: Any])?["choice"] as? String
-        guard let choice, let target = offered[choice] else { return GoalDecision(done: done, operation: "STUCK", target: nil) }
-        return GoalDecision(done: done, operation: operation, target: target)
+        let head = ["CLICK": "click_target", "TYPE_TEXT": "type_text_target"][operation]
+        guard let head else { return NextAction(done: done, operation: operation, target: nil) }
+        let choice = (answers[head] as? [String: Any])?["choice"] as? String
+        guard let choice, let target = offered[operation]?[choice] else { return NextAction(done: done, operation: "BLOCKED", target: nil) }
+        return NextAction(done: done, operation: operation, target: target)
     }
 
-    func decideGoal(goal: String, elements: [AccessibilityElement], appName: String, history: [String]) async throws -> GoalDecision {
-        let prepared = try Self.goalRequest(goal: goal, elements: elements, appName: appName, history: history)
-        let data = try await post(prepared.data, timeout: 15, message: "Goal step timed out.")
-        return try Self.decodeGoal(data, offered: prepared.offered)
+    func nextAction(task: String, elements: [AccessibilityElement], appName: String, history: [String]) async throws -> NextAction {
+        let prepared = try Self.nextActionRequest(task: task, elements: elements, appName: appName, history: history)
+        let data = try await post(prepared.data, timeout: 15, message: "Action selection timed out.")
+        return try Self.decodeNextAction(data, offered: prepared.offered)
     }
 
     private func post(_ body: Data, timeout: TimeInterval, message: String) async throws -> Data {

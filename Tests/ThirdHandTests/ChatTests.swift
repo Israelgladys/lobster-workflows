@@ -169,50 +169,49 @@ private final class EmptyLayer: ActionLayer {
 }
 
 @MainActor
-final class GoalStepTests: XCTestCase {
-    func testGoalStepsParseAndRequireAnOutcome() throws {
-        let goal = try PlanStep.parse(["action": "goal", "text": "The Skyfall album page is open"]).get()
-        XCTAssertEqual(goal.text, "The Skyfall album page is open")
-        XCTAssertEqual(goal.summary, "goal \"The Skyfall album page is open\"")
-        XCTAssertThrowsError(try PlanStep.parse(["action": "goal"]).get())
+final class UltrafastTests: XCTestCase {
+    func el(_ id: Int, _ role: String, _ label: String) -> AccessibilityElement {
+        AccessibilityElement(id: id, role: role, label: label, value: nil, enabled: true, actions: [], axElement: nil)
     }
 
-    func testGoalRequestAsksDoneActionAndTargetInOneCall() throws {
-        var play = AccessibilityElement(id: 1, role: "AXButton", label: "Play", value: nil, enabled: true, actions: [], axElement: nil)
-        play.context = "Skyfall · Adele"
-        let heading = AccessibilityElement(id: 2, role: "AXStaticText", label: "Now playing: Hello", value: nil, enabled: true, actions: [], axElement: nil)
-        let prepared = try JevClient.goalRequest(goal: "Skyfall is playing", elements: [play, heading], appName: "Spotify", history: [])
+    func testOneRequestAsksDoneOperationAndBothTargets() throws {
+        let prepared = try JevClient.nextActionRequest(task: "play Skyfall by Adele",
+            elements: [el(1, "AXButton", "Play"), el(2, "AXTextField", "Search"), el(3, "AXStaticText", "Now playing: Hello")],
+            appName: "Spotify", history: [])
         let body = try JSONSerialization.jsonObject(with: prepared.data) as! [String: Any]
         let questions = body["questions"] as! [String: [String: Any]]
-        XCTAssertEqual(Set(questions.keys), ["done", "operation", "click_target"])
-        XCTAssertNotNil((questions["operation"]!["criteria"] as! [String: String])["STUCK"])
-        XCTAssertEqual(Set(prepared.offered.keys), ["1"], "Only clickable controls are targets")
-        XCTAssertTrue(((body["state"] as! [String: Any])["screen"] as! String).contains("Now playing: Hello"), "Jev sees the screen to judge done")
+        XCTAssertEqual(Set(questions.keys), ["done", "operation", "click_target", "type_text_target"])
+        let operations = questions["operation"]!["criteria"] as! [String: String]
+        XCTAssertNotNil(operations["TYPE_TEXT"])
+        XCTAssertNotNil(operations["BLOCKED"])
+        XCTAssertEqual(Set(prepared.offered["TYPE_TEXT"]!.keys), ["2"], "Only editable fields can be typed into")
+        XCTAssertTrue(((body["state"] as! [String: Any])["screen"] as! String).contains("Now playing: Hello"))
     }
 
-    func testGoalDecisionDecoding() throws {
-        let target = AccessibilityElement(id: 1, role: "AXButton", label: "Play", value: nil, enabled: true, actions: [], axElement: nil)
-        let click = try JevClient.decodeGoal(Data(#"{"answers":{"done":{"noul":0.1},"operation":{"choice":"CLICK"},"click_target":{"choice":"1"}}}"#.utf8), offered: ["1": target])
-        XCTAssertEqual(click.operation, "CLICK")
-        XCTAssertEqual(click.target?.id, 1)
-        let none = try JevClient.decodeGoal(Data(#"{"answers":{"operation":{"choice":"CLICK"},"click_target":{"choice":"__none__"}}}"#.utf8), offered: ["1": target])
-        XCTAssertEqual(none.operation, "STUCK", "A click with no target is stuck")
-        let done = try JevClient.decodeGoal(Data(#"{"answers":{"done":{"noul":0.9},"operation":{"choice":"WAIT"}}}"#.utf8), offered: [:])
-        XCTAssertGreaterThanOrEqual(done.done, JevClient.goalDoneThreshold)
-        XCTAssertThrowsError(try JevClient.decodeGoal(Data("{}".utf8), offered: [:]))
+    func testOperationsWithoutCompatibleTargetsAreNotOffered() throws {
+        let prepared = try JevClient.nextActionRequest(task: "t", elements: [el(1, "AXButton", "Play")], appName: "App", history: [])
+        let body = try JSONSerialization.jsonObject(with: prepared.data) as! [String: Any]
+        let questions = body["questions"] as! [String: [String: Any]]
+        XCTAssertNil(questions["type_text_target"])
+        XCTAssertNil((questions["operation"]!["criteria"] as! [String: String])["TYPE_TEXT"])
     }
 
-    func testGoalStepsCanBeTurnedOffForExperiments() {
-        let enabled = CodexAgent.makeTools(actions: PlanStep.actions)
-        let disabled = CodexAgent.makeTools(actions: PlanStep.actions.filter { $0 != "goal" })
-        func actions(_ tools: [[String: Any]]) -> [String] {
-            let act = tools.first { $0["name"] as? String == "act" }!
-            let steps = ((act["parameters"] as! [String: Any])["properties"] as! [String: Any])["steps"] as! [String: Any]
-            return (((steps["items"] as! [String: Any])["properties"] as! [String: Any])["action"] as! [String: Any])["enum"] as! [String]
-        }
-        XCTAssertTrue(actions(enabled).contains("goal"))
-        XCTAssertFalse(actions(disabled).contains("goal"))
-        XCTAssertTrue(CodexAgent.baseInstructions.count < (CodexAgent.baseInstructions + CodexAgent.goalGuidance).count)
+    func testDecodingUsesOnlyTheChosenOperationsTarget() throws {
+        let offered = ["CLICK": ["1": el(1, "AXButton", "Play")], "TYPE_TEXT": ["2": el(2, "AXTextField", "Search")]]
+        let type = try JevClient.decodeNextAction(Data(#"{"answers":{"done":{"noul":0.1},"operation":{"choice":"TYPE_TEXT"},"click_target":{"choice":"1"},"type_text_target":{"choice":"2"}}}"#.utf8), offered: offered)
+        XCTAssertEqual(type.operation, "TYPE_TEXT")
+        XCTAssertEqual(type.target?.id, 2)
+        let none = try JevClient.decodeNextAction(Data(#"{"answers":{"operation":{"choice":"CLICK"},"click_target":{"choice":"__none__"}}}"#.utf8), offered: offered)
+        XCTAssertEqual(none.operation, "BLOCKED")
+        let wait = try JevClient.decodeNextAction(Data(#"{"answers":{"done":{"noul":0.9},"operation":{"choice":"WAIT"}}}"#.utf8), offered: offered)
+        XCTAssertGreaterThanOrEqual(wait.done, JevClient.doneThreshold)
+        XCTAssertNil(wait.target)
+        XCTAssertThrowsError(try JevClient.decodeNextAction(Data("{}".utf8), offered: offered))
+    }
+
+    func testPlannerHasNoGoalSteps() {
+        XCTAssertFalse(PlanStep.actions.contains("goal"))
+        XCTAssertThrowsError(try PlanStep.parse(["action": "goal", "text": "x"]).get())
     }
 
     func testBenchmarkSummary() {
@@ -220,8 +219,8 @@ final class GoalStepTests: XCTestCase {
             ["state": "done", "total_ms": 8000, "codex_calls": 1, "jev_calls": 3, "actions": 4],
             ["state": "failed", "total_ms": 20000, "codex_calls": 4, "jev_calls": 1, "actions": 6]
         ]
-        let summary = Benchmark.summarize(rows, variant: "goals on")
-        XCTAssertTrue(summary.hasPrefix("Benchmark (goals on): 1/2 done · median 14.0s · codex 2.5 calls"))
+        let summary = Benchmark.summarize(rows, variant: "ultrafast")
+        XCTAssertTrue(summary.hasPrefix("Benchmark (ultrafast): 1/2 done · median 14.0s · codex 2.5 calls"))
         XCTAssertNotNil(try? JSONEncoder().encode(Benchmark.sample))
     }
 }

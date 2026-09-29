@@ -438,7 +438,6 @@ final class PlanValidationTests: XCTestCase {
         let item = (steps["steps"] as! [String: Any])["items"] as! [String: Any]
         XCTAssertEqual(item["required"] as? [String], ["action", "target", "role", "near", "text", "key", "direction"])
         let action = (item["properties"] as! [String: Any])["action"] as! [String: Any]
-        XCTAssertEqual(action["enum"] as? [String], CodexAgent.goalStepsEnabled
-                       ? ["click", "type", "press", "scroll", "wait", "goal"] : ["click", "type", "press", "scroll", "wait"])
+        XCTAssertEqual(action["enum"] as? [String], ["click", "type", "press", "scroll", "wait"])
     }
 }

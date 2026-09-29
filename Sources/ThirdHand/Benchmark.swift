@@ -48,7 +48,7 @@ final class Benchmark {
         guard !isRunning else { return }
         isRunning = true
         defer { isRunning = false }
-        let variant = CodexAgent.goalStepsEnabled ? "goals on" : "goals off"
+        let variant = TaskRunner.ultrafastEnabled ? "ultrafast" : "planner"
         let spec: Spec
         do { spec = try loadSpec() } catch {
             let alert = NSAlert()

@@ -149,6 +149,19 @@ final class TaskRunner: ActionLayer {
         try checkFocus()
         AXUIElementSetAttributeValue(target.appElement, "AXManualAccessibility" as CFString, kCFBooleanTrue)
         AXUIElementSetAttributeValue(target.appElement, "AXEnhancedUserInterface" as CFString, kCFBooleanTrue)
+        var context = context
+        if background, Self.ultrafastEnabled, cdpClient != nil {
+            phase = "fast"
+            let fast = try await runFastLoop(task: goal)
+            if fast.status == "verified" {
+                Log.info("Task completed fast_path=1 actions=\(actions)")
+                RunMetrics.current.fastPath()
+                delegate?.taskRunnerDone(self, summary: "Done: \(goal)")
+                return
+            }
+            Log.info("Fast path handed off actions=\(actions)")
+            context.append("A quick attempt didn't finish. \(fast.detail)")
+        }
         phase = "planning"
         // Plan quickly and escalate effort only after a failed plan; manual settings pin the tier.
         let override = (CodexClient.modelOverride, CodexClient.effortOverride)
@@ -190,76 +203,77 @@ final class TaskRunner: ActionLayer {
         return elements.filter { ids.contains(String($0.id)) }
     }
 
-    nonisolated static let maxGoalActions = 6
+    /// `defaults write com.thirdhand.app Ultrafast -bool YES`: Jev drives background tasks directly (experiment).
+    nonisolated static var ultrafastEnabled: Bool { UserDefaults.standard.bool(forKey: "Ultrafast") }
+    nonisolated static let maxFastActions = 15
     /// `defaults write com.thirdhand.app DebugGrounding -bool YES` logs target and candidate labels locally.
     nonisolated static var debugGrounding: Bool { UserDefaults.standard.bool(forKey: "DebugGrounding") }
-    private var inGoal = false
+    /// Short settles for the ultrafast loop: it re-reads the page every cycle and Jev can choose to wait.
+    private var fastSettle = false
+    private var fieldText: [String: String] = [:]
 
-    /// A goal step: Jev reads the screen, decides whether the goal is met, and picks the next action itself,
-    /// so the planner doesn't have to plan screens it can't see. Returns to the planner when stuck.
-    private func performGoal(_ goal: String) async throws -> StepOutcome {
-        RunMetrics.current.goalStarted()
-        inGoal = true
-        defer { inGoal = false }
+    /// Ultrafast: Jev reads the page and picks the next operation and target in one request per cycle,
+    /// and a prompt-only planner call writes text when Jev chooses to type. Returns verified when Jev
+    /// judges the task done; anything else hands the task to the planner.
+    private func runFastLoop(task: String) async throws -> StepOutcome {
+        fastSettle = true
+        defer { fastSettle = false }
         var taken: [String] = []
         var latest: [AccessibilityElement] = []
-        var retriedStuck = false
-        var lastClick: (identity: String, succeeded: Bool)?
-        for iteration in 0..<Self.maxGoalActions + 1 {
+        var retriedBlocked = false
+        var lastAction: (identity: String, succeeded: Bool)?
+        let writer = CodexClient(credentials: credentials)
+        for iteration in 0..<Self.maxFastActions + 1 {
             try checkFocus()
-            delegate?.taskRunner(self, status: "Working toward: \(goal.prefix(60))…")
-            phase = "goal_observing"
+            delegate?.taskRunner(self, status: "Working… (\(actions))")
+            phase = "fast_observing"
             let observation = try await observe()
             latest = observation.elements
-            phase = "goal_deciding"
-            let decision: JevClient.GoalDecision
-            do {
-                decision = try await jev.decideGoal(goal: goal, elements: observation.elements, appName: target.name, history: taken)
-            } catch is CancellationError { throw CancellationError() }
-            catch let error as JevServiceError { throw error }
-            catch { return StepOutcome(status: "blocked", detail: "The goal selector failed: \(error.localizedDescription)", elements: latest) }
-            Log.info("Goal iteration=\(iteration) operation=\(decision.operation) done=\(decision.done)")
+            phase = "fast_deciding"
+            let decision = try await jev.nextAction(task: task, elements: observation.elements, appName: target.name, history: taken)
+            Log.info("Fast iteration=\(iteration) operation=\(decision.operation) done=\(String(format: "%.2f", decision.done))")
             if Self.debugGrounding, let chosen = decision.target {
-                Log.info("Debug goal click=\(chosen.displayRole):\(chosen.displayLabel.prefix(40))\(chosen.context.map { " in " + $0.prefix(30) } ?? "")")
+                Log.info("Debug fast target=\(chosen.displayRole):\(chosen.displayLabel.prefix(40))\(chosen.context.map { " in " + $0.prefix(30) } ?? "")")
             }
-            // The previous step may have just started loading the screen the goal needs: settle and look again once.
-            if decision.operation == "STUCK", !retriedStuck {
-                retriedStuck = true
-                if let cdp = cdpClient { _ = try? await cdp.waitForQuiet(firstChangeMs: 1000, quietMs: 350, maxMs: 2500) }
-                else { try await Task.sleep(nanoseconds: 800_000_000) }
+            if decision.done >= JevClient.doneThreshold || (decision.operation == "DONE" && decision.done >= 0.5) {
+                return StepOutcome(status: "verified", detail: taken.joined(separator: ", "), elements: latest)
+            }
+            if decision.operation == "BLOCKED" || decision.operation == "DONE" {
+                // The previous action may have just started loading what's needed: settle and look once more.
+                guard !retriedBlocked else { break }
+                retriedBlocked = true
+                if let cdp = cdpClient { _ = try? await cdp.waitForQuiet(firstChangeMs: 600, quietMs: 150, maxMs: 1500) }
                 continue
             }
-            // "DONE" alone isn't enough: it must come with at least even confidence that the goal is met.
-            if decision.done >= JevClient.goalDoneThreshold || (decision.operation == "DONE" && decision.done >= 0.5) {
-                let how = taken.isEmpty ? "already on screen" : "after " + taken.joined(separator: ", ")
-                return StepOutcome(status: "verified", detail: "Goal reached (\(how)): \(goal)", elements: latest)
-            }
-            guard iteration < Self.maxGoalActions else { break }
-            let sub: PlanStep
+            guard iteration < Self.maxFastActions else { break }
+            var step: PlanStep
             switch decision.operation {
-            case "CLICK": sub = PlanStep(action: "click", target: decision.target?.displayLabel)
-            case "SCROLL_DOWN": sub = PlanStep(action: "scroll", direction: "down")
-            case "SCROLL_UP": sub = PlanStep(action: "scroll", direction: "up")
-            case "PRESS_RETURN": sub = PlanStep(action: "press", key: "return")
-            case "PRESS_ESCAPE": sub = PlanStep(action: "press", key: "escape")
-            case "WAIT": sub = PlanStep(action: "wait")
-            default:
-                let tried = taken.isEmpty ? "" : " Tried: " + taken.joined(separator: ", ") + "."
-                return StepOutcome(status: "blocked", detail: "Couldn't find a way to: \(goal).\(tried)", elements: latest)
+            case "CLICK": step = PlanStep(action: "click", target: decision.target?.displayLabel)
+            case "TYPE_TEXT":
+                guard let field = decision.target else { continue }
+                let key = field.role + "|" + field.displayLabel
+                let text: String
+                if let cached = fieldText[key] { text = cached } else {
+                    delegate?.taskRunner(self, status: "Writing text…")
+                    text = try await writer.writeText(task: task, field: field, appName: target.name)
+                    fieldText[key] = text
+                }
+                step = PlanStep(action: "type", target: field.displayLabel, text: text)
+            case "SCROLL_DOWN": step = PlanStep(action: "scroll", direction: "down")
+            case "SCROLL_UP": step = PlanStep(action: "scroll", direction: "up")
+            case "PRESS_RETURN": step = PlanStep(action: "press", key: "return")
+            case "PRESS_ESCAPE": step = PlanStep(action: "press", key: "escape")
+            default: step = PlanStep(action: "wait")
             }
-            let identity = decision.target.map { "\($0.role)|\($0.displayLabel)|\($0.context ?? "")" }
-            if let identity, let lastClick, lastClick.identity == identity, !lastClick.succeeded {
-                return StepOutcome(status: "blocked", detail: "Clicking \"\(decision.target?.displayLabel ?? "")\" again won't help: it had no effect. Tried: \(taken.joined(separator: ", ")). Goal: \(goal)", elements: latest)
-            }
-            let outcome = try await perform(step: sub, pinned: decision.operation == "CLICK" ? decision.target : nil)
-            lastClick = identity.map { ($0, outcome.status == "verified") }
-            taken.append(sub.summary + (outcome.succeeded ? "" : " (\(outcome.status))"))
+            let identity = decision.operation + "|" + (decision.target.map { "\($0.role)|\($0.displayLabel)|\($0.context ?? "")" } ?? "")
+            if let lastAction, lastAction.identity == identity, !lastAction.succeeded, decision.operation != "WAIT" { break }
+            let outcome = try await perform(step: step, pinned: decision.target)
+            lastAction = (identity, outcome.status == "verified" || outcome.status == "sent")
+            taken.append(step.summary + (outcome.succeeded ? "" : " (\(outcome.status))"))
             latest = outcome.elements
-            if ["blocked", "rejected"].contains(outcome.status) {
-                return StepOutcome(status: outcome.status, detail: "While working toward \"\(goal)\": \(outcome.detail)", elements: latest)
-            }
+            if ["blocked", "rejected"].contains(outcome.status) { break }
         }
-        return StepOutcome(status: "unverified", detail: "Goal not confirmed after \(taken.count) actions (\(taken.joined(separator: ", "))): \(goal)", elements: latest)
+        return StepOutcome(status: "blocked", detail: taken.isEmpty ? "No progress." : "Tried: " + taken.joined(separator: ", "), elements: latest)
     }
 
     /// One planner step. The action is fixed by the planner; a click or type target is resolved by exact label
@@ -270,7 +284,6 @@ final class TaskRunner: ActionLayer {
     }
 
     private func perform(step: PlanStep, pinned: AccessibilityElement?) async throws -> StepOutcome {
-        if step.action == "goal", let goal = step.text { return try await performGoal(goal) }
         guard actions < maxSteps else {
             throw ControllerError.invalid("Stopped after \(maxSteps) actions. The final screen does not confirm completion.")
         }
@@ -304,11 +317,13 @@ final class TaskRunner: ActionLayer {
                 let label = step.target ?? ""
                 let candidates = pool(for: step.action, in: observation.elements)
                 if let pinned {
-                    // A goal step already chose this control on the previous read of the screen.
+                    // Jev already chose this control on the previous read of the screen.
                     guard let current = ObservationState.matching(pinned, in: candidates) else {
-                        return StepOutcome(status: "blocked", detail: "The control chosen for the goal is no longer on screen.", elements: latest)
+                        return StepOutcome(status: "blocked", detail: "The chosen control is no longer on screen.", elements: latest)
                     }
-                    decision = AgentDecision(operation: current.source == "ocr" ? "CLICK_TEXT" : "CLICK", targetIndex: String(current.id))
+                    decision = step.action == "type"
+                        ? AgentDecision(operation: "TYPE_TEXT", targetIndex: String(current.id), textValue: step.text)
+                        : AgentDecision(operation: current.source == "ocr" ? "CLICK_TEXT" : "CLICK", targetIndex: String(current.id))
                 } else {
                     let matches = StepMatcher.exact(target: label, role: step.role, near: step.near, in: candidates)
                     let signature = ObservationState.signature(observation.elements)
@@ -415,7 +430,7 @@ final class TaskRunner: ActionLayer {
             }
             delegate?.taskRunner(self, status: "\(decision.operation == "TYPE_TEXT" ? "Entering text" : "Working")… (\(actions + 1)/\(maxSteps))")
             actions += 1
-            RunMetrics.current.action(inGoal: inGoal)
+            RunMetrics.current.action(fast: fastSettle)
             phase = "executing_\(decision.operation)"
             var executionError: String?
             do { try await execute(decision, elements: observation.elements, windowFrame: observation.frame) }
@@ -548,8 +563,11 @@ final class TaskRunner: ActionLayer {
             do {
                 // Typing redraws immediately; Return and clicks may navigate and load results.
                 let navigates = decision.operation != "TYPE_TEXT"
-                let changed = try await cdp.waitForQuiet(firstChangeMs: navigates ? 1000 : 600,
-                                                         quietMs: navigates ? 350 : 150, maxMs: navigates ? 3000 : 1500)
+                // The ultrafast loop re-reads the page every cycle and can wait, so it settles briefly.
+                let changed = fastSettle
+                    ? try await cdp.waitForQuiet(firstChangeMs: navigates ? 250 : 200, quietMs: navigates ? 80 : 60, maxMs: navigates ? 700 : 400)
+                    : try await cdp.waitForQuiet(firstChangeMs: navigates ? 1000 : 600,
+                                                 quietMs: navigates ? 350 : 150, maxMs: navigates ? 3000 : 1500)
                 let latest = try await observe()
                 Log.info("Settle via=dom changed=\(changed)")
                 return latest
