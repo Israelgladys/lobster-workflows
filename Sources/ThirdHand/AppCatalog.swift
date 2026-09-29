@@ -89,7 +89,8 @@ final class AppCatalog: ObservableObject {
             throw ControllerError.invalid("\(app.name) isn't installed.")
         }
         let configuration = NSWorkspace.OpenConfiguration()
-        configuration.activates = true
+        // Stay in the chat while the planner reads the app; it comes forward before the first input.
+        configuration.activates = false
         Log.info("Opening app bundle=\(app.bundleID) running=\(running != nil)")
         let launched = try await NSWorkspace.shared.openApplication(at: url, configuration: configuration)
         let deadline = Date().addingTimeInterval(timeout)

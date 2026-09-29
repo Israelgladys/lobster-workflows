@@ -27,6 +27,8 @@ final class TaskRunner: ActionLayer {
     private var progress = RunProgress()
     private var phase = "starting"
     private var terminalInputPending = false
+    /// Planning reads the app in the background; the app must stay in front once input starts.
+    private var inForeground = false
     private var actions = 0
     private lazy var jev = JevClient(apiKey: apiKey)
 
@@ -55,7 +57,7 @@ final class TaskRunner: ActionLayer {
         try Task.checkCancellation()
         guard active else { throw CancellationError() }
         guard !target.application.isTerminated,
-              NSWorkspace.shared.frontmostApplication?.processIdentifier == target.pid else {
+              !inForeground || NSWorkspace.shared.frontmostApplication?.processIdentifier == target.pid else {
             Log.info("Task focus lost phase=\(phase)")
             throw ControllerError.invalid("Stopped because the active app changed. Return to \(target.name) and try again.")
         }
@@ -79,8 +81,6 @@ final class TaskRunner: ActionLayer {
 
     private func runAgent() async throws {
         guard AXIsProcessTrusted() else { throw ControllerError.invalid("Enable Accessibility for Third Hand in System Settings.") }
-        target.application.activate()
-        try await Task.sleep(nanoseconds: 400_000_000)
         try checkFocus()
         if ElectronDetector.isElectron(target), let window = WindowSnapshot.frontWindow(pid: target.pid),
            let port = await ElectronDetector.findDebugPort(pid: target.pid) {
@@ -139,6 +139,7 @@ final class TaskRunner: ActionLayer {
         guard actions < maxSteps else {
             throw ControllerError.invalid("Stopped after \(maxSteps) actions. The final screen does not confirm completion.")
         }
+        try await bringToFront()
         var latest: [AccessibilityElement] = []
         // Separate observation budget bounds stale-window retries and recovery within a step.
         for _ in 0..<4 {
@@ -269,6 +270,25 @@ final class TaskRunner: ActionLayer {
                                detail: "\(described): \(verification.detail)", elements: after.elements)
         }
         return StepOutcome(status: "blocked", detail: "The app kept changing before this step could be performed safely.", elements: latest)
+    }
+
+    /// Brings the app forward before its first input, once planning is done.
+    private func bringToFront() async throws {
+        guard !inForeground else { return }
+        phase = "activating"
+        delegate?.taskRunner(self, status: "Switching to \(target.name)…")
+        target.application.activate()
+        for _ in 0..<20 where NSWorkspace.shared.frontmostApplication?.processIdentifier != target.pid {
+            try Task.checkCancellation()
+            try await Task.sleep(nanoseconds: 100_000_000)
+        }
+        guard NSWorkspace.shared.frontmostApplication?.processIdentifier == target.pid else {
+            throw ControllerError.invalid("\(target.name) didn't come to the front.")
+        }
+        // Let the window finish redrawing as the key window before observing it for input.
+        try await Task.sleep(nanoseconds: 250_000_000)
+        inForeground = true
+        Log.info("Target activated for input")
     }
 
     /// Adds on-device OCR once per task. Returns false when already used or not permitted.

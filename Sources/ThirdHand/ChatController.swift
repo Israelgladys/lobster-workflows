@@ -99,7 +99,7 @@ final class ChatController: ObservableObject, TaskRunnerDelegate {
         let context = store.context(for: job.threadID, before: job.requestID)
         current = (job, nil, nil, Date())
         let running = catalog.isRunning(job.app.bundleID)
-        setStatus(running ? "Switching to \(job.app.name)…" : "Opening \(job.app.name)…")
+        setStatus(running ? "Reading \(job.app.name)…" : "Opening \(job.app.name)…")
         current?.task = Task { [weak self] in
             do {
                 let app = try await AppCatalog.prepare(job.app)
