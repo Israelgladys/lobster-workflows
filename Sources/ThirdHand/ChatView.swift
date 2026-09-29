@@ -275,7 +275,10 @@ private struct MessageRow: View {
                 TakeoverCard(message: message, onChoose: onChoose, onStop: onStop)
             }
         case .done:
-            result(icon: "checkmark", color: Theme.success, text: message.text)
+            VStack(alignment: .leading, spacing: 4) {
+                result(icon: "checkmark", color: Theme.success, text: message.text)
+                if let metrics = message.metrics { MetricsLine(metrics: metrics) }
+            }
         case .failed:
             result(icon: "xmark", color: Theme.failure, text: message.text)
         case .stopped:
@@ -487,6 +490,19 @@ private struct TakeoverCard: View {
         .frame(maxWidth: 520, alignment: .leading)
         .background(RoundedRectangle(cornerRadius: 12).fill(Theme.surface))
         .overlay(RoundedRectangle(cornerRadius: 12).stroke(Theme.border))
+    }
+}
+
+/// "codex 1× 4.2s · jev 3× 0.9s · 5 actions (3 in goals)" for comparing runs.
+private struct MetricsLine: View {
+    let metrics: [String: Int]
+
+    var body: some View {
+        let seconds = { (key: String) in String(format: "%.1fs", Double(metrics[key] ?? 0) / 1000) }
+        let goals = metrics["goal_actions"].map { $0 > 0 ? " (\($0) in goals)" : "" } ?? ""
+        Text("codex \(metrics["codex_calls"] ?? 0)× \(seconds("codex_ms")) · jev \(metrics["jev_calls"] ?? 0)× \(seconds("jev_ms")) · \(metrics["actions"] ?? 0) actions\(goals)")
+            .font(.system(size: 10, design: .monospaced))
+            .foregroundStyle(Theme.tertiary)
     }
 }
 

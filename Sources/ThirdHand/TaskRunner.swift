@@ -52,6 +52,7 @@ final class TaskRunner: ActionLayer {
 
     func start() {
         guard task == nil else { return }
+        RunMetrics.current = RunMetrics()
         active = true
         task = Task { await run() }
     }
@@ -74,7 +75,10 @@ final class TaskRunner: ActionLayer {
     }
 
     private func run() async {
-        defer { active = false; cdpClient?.disconnect(); cdpClient = nil }
+        defer {
+            active = false; cdpClient?.disconnect(); cdpClient = nil
+            Log.info("Metrics " + RunMetrics.current.logLine)
+        }
         let watchdog = Task { [weak self] in
             var elapsed: TimeInterval = 0
             while !Task.isCancelled {
@@ -186,9 +190,87 @@ final class TaskRunner: ActionLayer {
         return elements.filter { ids.contains(String($0.id)) }
     }
 
+    nonisolated static let maxGoalActions = 6
+    /// `defaults write com.thirdhand.app DebugGrounding -bool YES` logs target and candidate labels locally.
+    nonisolated static var debugGrounding: Bool { UserDefaults.standard.bool(forKey: "DebugGrounding") }
+    private var inGoal = false
+
+    /// A goal step: Jev reads the screen, decides whether the goal is met, and picks the next action itself,
+    /// so the planner doesn't have to plan screens it can't see. Returns to the planner when stuck.
+    private func performGoal(_ goal: String) async throws -> StepOutcome {
+        RunMetrics.current.goalStarted()
+        inGoal = true
+        defer { inGoal = false }
+        var taken: [String] = []
+        var latest: [AccessibilityElement] = []
+        var retriedStuck = false
+        var lastClick: (identity: String, succeeded: Bool)?
+        for iteration in 0..<Self.maxGoalActions + 1 {
+            try checkFocus()
+            delegate?.taskRunner(self, status: "Working toward: \(goal.prefix(60))…")
+            phase = "goal_observing"
+            let observation = try await observe()
+            latest = observation.elements
+            phase = "goal_deciding"
+            let decision: JevClient.GoalDecision
+            do {
+                decision = try await jev.decideGoal(goal: goal, elements: observation.elements, appName: target.name, history: taken)
+            } catch is CancellationError { throw CancellationError() }
+            catch let error as JevServiceError { throw error }
+            catch { return StepOutcome(status: "blocked", detail: "The goal selector failed: \(error.localizedDescription)", elements: latest) }
+            Log.info("Goal iteration=\(iteration) operation=\(decision.operation) done=\(decision.done)")
+            if Self.debugGrounding, let chosen = decision.target {
+                Log.info("Debug goal click=\(chosen.displayRole):\(chosen.displayLabel.prefix(40))\(chosen.context.map { " in " + $0.prefix(30) } ?? "")")
+            }
+            // The previous step may have just started loading the screen the goal needs: settle and look again once.
+            if decision.operation == "STUCK", !retriedStuck {
+                retriedStuck = true
+                if let cdp = cdpClient { _ = try? await cdp.waitForQuiet(firstChangeMs: 1000, quietMs: 350, maxMs: 2500) }
+                else { try await Task.sleep(nanoseconds: 800_000_000) }
+                continue
+            }
+            // "DONE" alone isn't enough: it must come with at least even confidence that the goal is met.
+            if decision.done >= JevClient.goalDoneThreshold || (decision.operation == "DONE" && decision.done >= 0.5) {
+                let how = taken.isEmpty ? "already on screen" : "after " + taken.joined(separator: ", ")
+                return StepOutcome(status: "verified", detail: "Goal reached (\(how)): \(goal)", elements: latest)
+            }
+            guard iteration < Self.maxGoalActions else { break }
+            let sub: PlanStep
+            switch decision.operation {
+            case "CLICK": sub = PlanStep(action: "click", target: decision.target?.displayLabel)
+            case "SCROLL_DOWN": sub = PlanStep(action: "scroll", direction: "down")
+            case "SCROLL_UP": sub = PlanStep(action: "scroll", direction: "up")
+            case "PRESS_RETURN": sub = PlanStep(action: "press", key: "return")
+            case "PRESS_ESCAPE": sub = PlanStep(action: "press", key: "escape")
+            case "WAIT": sub = PlanStep(action: "wait")
+            default:
+                let tried = taken.isEmpty ? "" : " Tried: " + taken.joined(separator: ", ") + "."
+                return StepOutcome(status: "blocked", detail: "Couldn't find a way to: \(goal).\(tried)", elements: latest)
+            }
+            let identity = decision.target.map { "\($0.role)|\($0.displayLabel)|\($0.context ?? "")" }
+            if let identity, let lastClick, lastClick.identity == identity, !lastClick.succeeded {
+                return StepOutcome(status: "blocked", detail: "Clicking \"\(decision.target?.displayLabel ?? "")\" again won't help: it had no effect. Tried: \(taken.joined(separator: ", ")). Goal: \(goal)", elements: latest)
+            }
+            let outcome = try await perform(step: sub, pinned: decision.operation == "CLICK" ? decision.target : nil)
+            lastClick = identity.map { ($0, outcome.status == "verified") }
+            taken.append(sub.summary + (outcome.succeeded ? "" : " (\(outcome.status))"))
+            latest = outcome.elements
+            if ["blocked", "rejected"].contains(outcome.status) {
+                return StepOutcome(status: outcome.status, detail: "While working toward \"\(goal)\": \(outcome.detail)", elements: latest)
+            }
+        }
+        return StepOutcome(status: "unverified", detail: "Goal not confirmed after \(taken.count) actions (\(taken.joined(separator: ", "))): \(goal)", elements: latest)
+    }
+
     /// One planner step. The action is fixed by the planner; a click or type target is resolved by exact label
-    /// when unique, otherwise Jev chooses among controls compatible with that action only.
+    /// when unique, otherwise Jev chooses among controls compatible with that action only. `pinned` is a
+    /// control a goal step already chose, used instead of grounding by label.
     func perform(step: PlanStep) async throws -> StepOutcome {
+        try await perform(step: step, pinned: nil)
+    }
+
+    private func perform(step: PlanStep, pinned: AccessibilityElement?) async throws -> StepOutcome {
+        if step.action == "goal", let goal = step.text { return try await performGoal(goal) }
         guard actions < maxSteps else {
             throw ControllerError.invalid("Stopped after \(maxSteps) actions. The final screen does not confirm completion.")
         }
@@ -221,61 +303,74 @@ final class TaskRunner: ActionLayer {
             default:
                 let label = step.target ?? ""
                 let candidates = pool(for: step.action, in: observation.elements)
-                let matches = StepMatcher.exact(target: label, role: step.role, near: step.near, in: candidates)
-                let signature = ObservationState.signature(observation.elements)
-                defer { previousSignature = signature }
-                if matches.isEmpty, Date() < appearDeadline, signature != previousSignature {
-                    phase = "awaiting_target"
-                    try await Task.sleep(nanoseconds: 350_000_000)
-                    continue
-                }
-                if step.near != nil {
-                    let unnarrowed = StepMatcher.exact(target: label, role: step.role, in: candidates).count
-                    Log.info("Grounding near=provided matches_before=\(unnarrowed) matches_after=\(matches.count)")
-                }
-                var chosen: AccessibilityElement?
-                // Planned targets for screens that didn't exist yet are the text the planner expected to see;
-                // the real control often wraps it ("Play Skyfall by Adele", or a row). Match by containment first.
-                let containing = matches.isEmpty ? StepMatcher.containing(target: label, near: step.near, in: candidates) : []
-                if matches.count == 1 {
-                    chosen = matches[0]
-                    Log.info("Grounded via=exact action=\(step.action)")
-                } else if containing.count == 1 {
-                    chosen = containing[0]
-                    Log.info("Grounded via=contains action=\(step.action)")
-                } else if !candidates.isEmpty {
-                    phase = "grounding"
-                    do {
-                        chosen = try await jev.ground(action: step.action, target: label, role: step.role, near: step.near,
-                                                      candidates: matches.count > 1 ? matches : containing.count > 1 ? containing : candidates,
-                                                      allExact: matches.count > 1, appName: target.name)
-                    } catch is CancellationError { throw CancellationError() }
-                    catch let error as JevServiceError { throw error }
-                    catch {
-                        try checkFocus()
-                        return StepOutcome(status: "blocked", detail: "The action selector failed: \(error.localizedDescription)", elements: latest)
+                if let pinned {
+                    // A goal step already chose this control on the previous read of the screen.
+                    guard let current = ObservationState.matching(pinned, in: candidates) else {
+                        return StepOutcome(status: "blocked", detail: "The control chosen for the goal is no longer on screen.", elements: latest)
                     }
-                    Log.info("Grounded via=jev action=\(step.action) duplicates=\(matches.count) containing=\(containing.count) found=\(chosen != nil)")
-                    // Identical controls with no hint to tell them apart: the planner asked for exactly this
-                    // label, so take the first in reading order (usually the top result).
-                    if chosen == nil, matches.count > 1, step.near == nil {
-                        chosen = matches[0]
-                        Log.info("Grounded via=first_duplicate action=\(step.action)")
-                    }
-                }
-                guard let chosen else {
-                    let reason = "No \(step.action == "type" ? "editable field" : "clickable control") labelled \"\(label)\" is on screen."
-                    if enableOCR(reason) { continue }
-                    let permission = useOCR || CGPreflightScreenCaptureAccess() ? "" : " Enable Screen Recording for Third Hand to read unlabeled screen text."
-                    return StepOutcome(status: "blocked", detail: reason + permission + " Use a label from the current screen, or scroll or open a menu first.", elements: latest)
-                }
-                if step.action == "type" {
-                    guard !(target.isTerminal && terminalInputPending) else {
-                        return StepOutcome(status: "rejected", detail: "Terminal input was already entered and not submitted. Press Return to run it, or clear the line first.", elements: latest)
-                    }
-                    decision = AgentDecision(operation: "TYPE_TEXT", targetIndex: String(chosen.id), textValue: step.text)
+                    decision = AgentDecision(operation: current.source == "ocr" ? "CLICK_TEXT" : "CLICK", targetIndex: String(current.id))
                 } else {
-                    decision = AgentDecision(operation: chosen.source == "ocr" ? "CLICK_TEXT" : "CLICK", targetIndex: String(chosen.id))
+                    let matches = StepMatcher.exact(target: label, role: step.role, near: step.near, in: candidates)
+                    let signature = ObservationState.signature(observation.elements)
+                    defer { previousSignature = signature }
+                    if matches.isEmpty, Date() < appearDeadline, signature != previousSignature {
+                        phase = "awaiting_target"
+                        try await Task.sleep(nanoseconds: 350_000_000)
+                        continue
+                    }
+                    if step.near != nil {
+                        let unnarrowed = StepMatcher.exact(target: label, role: step.role, in: candidates).count
+                        Log.info("Grounding near=provided matches_before=\(unnarrowed) matches_after=\(matches.count)")
+                    }
+                    var chosen: AccessibilityElement?
+                    // Planned targets for screens that didn't exist yet are the text the planner expected to see;
+                    // the real control often wraps it ("Play Skyfall by Adele", or a row). Match by containment first.
+                    let containing = matches.isEmpty ? StepMatcher.containing(target: label, near: step.near, in: candidates) : []
+                    if matches.count == 1 {
+                        chosen = matches[0]
+                        Log.info("Grounded via=exact action=\(step.action)")
+                    } else if containing.count == 1 {
+                        chosen = containing[0]
+                        Log.info("Grounded via=contains action=\(step.action)")
+                    } else if !candidates.isEmpty {
+                        phase = "grounding"
+                        do {
+                            chosen = try await jev.ground(action: step.action, target: label, role: step.role, near: step.near,
+                                                          candidates: matches.count > 1 ? matches : containing.count > 1 ? containing : candidates,
+                                                          allExact: matches.count > 1, appName: target.name)
+                        } catch is CancellationError { throw CancellationError() }
+                        catch let error as JevServiceError { throw error }
+                        catch {
+                            try checkFocus()
+                            return StepOutcome(status: "blocked", detail: "The action selector failed: \(error.localizedDescription)", elements: latest)
+                        }
+                        Log.info("Grounded via=jev action=\(step.action) duplicates=\(matches.count) containing=\(containing.count) found=\(chosen != nil)")
+                        if Self.debugGrounding {
+                            let shown = (matches.count > 1 ? matches : containing.count > 1 ? containing : candidates).prefix(6)
+                                .map { "\($0.displayRole):\($0.displayLabel.prefix(40))\($0.context.map { " in " + $0.prefix(30) } ?? "")" }
+                            Log.info("Debug ground target=\(label.prefix(60)) near=\(step.near?.prefix(40) ?? "-") chosen=\(chosen?.displayLabel.prefix(40) ?? "none") top=\(shown)")
+                        }
+                        // Identical controls: the planner asked for exactly this label, so if Jev can't tell them
+                        // apart take the first in reading order (usually the top result).
+                        if chosen == nil, matches.count > 1 {
+                            chosen = matches[0]
+                            Log.info("Grounded via=first_duplicate action=\(step.action)")
+                        }
+                    }
+                    guard let chosen else {
+                        let reason = "No \(step.action == "type" ? "editable field" : "clickable control") labelled \"\(label)\" is on screen."
+                        if enableOCR(reason) { continue }
+                        let permission = useOCR || CGPreflightScreenCaptureAccess() ? "" : " Enable Screen Recording for Third Hand to read unlabeled screen text."
+                        return StepOutcome(status: "blocked", detail: reason + permission + " Use a label from the current screen, or scroll or open a menu first.", elements: latest)
+                    }
+                    if step.action == "type" {
+                        guard !(target.isTerminal && terminalInputPending) else {
+                            return StepOutcome(status: "rejected", detail: "Terminal input was already entered and not submitted. Press Return to run it, or clear the line first.", elements: latest)
+                        }
+                        decision = AgentDecision(operation: "TYPE_TEXT", targetIndex: String(chosen.id), textValue: step.text)
+                    } else {
+                        decision = AgentDecision(operation: chosen.source == "ocr" ? "CLICK_TEXT" : "CLICK", targetIndex: String(chosen.id))
+                    }
                 }
             }
             try checkFocus()
@@ -320,6 +415,7 @@ final class TaskRunner: ActionLayer {
             }
             delegate?.taskRunner(self, status: "\(decision.operation == "TYPE_TEXT" ? "Entering text" : "Working")… (\(actions + 1)/\(maxSteps))")
             actions += 1
+            RunMetrics.current.action(inGoal: inGoal)
             phase = "executing_\(decision.operation)"
             var executionError: String?
             do { try await execute(decision, elements: observation.elements, windowFrame: observation.frame) }

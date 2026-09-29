@@ -8,8 +8,15 @@ struct ActionVerification {
 
 enum ObservationState {
     /// Snapshot-local IDs and traversal order are not identities.
+    /// Playback progress, sliders, and running clocks change on their own; they're not evidence an action worked.
+    static func isAmbient(_ element: AccessibilityElement) -> Bool {
+        if ["AXProgressIndicator", "AXSlider"].contains(element.role) { return true }
+        return element.role == "AXStaticText"
+            && element.displayLabel.range(of: #"^-?\d{1,2}:\d{2}(:\d{2})?$"#, options: .regularExpression) != nil
+    }
+
     static func signature(_ elements: [AccessibilityElement]) -> String {
-        elements.map { element in
+        elements.filter { !isAmbient($0) }.map { element in
             let box = element.frame.map { "\(Int(($0.midX / 8).rounded())),\(Int(($0.midY / 8).rounded()))" } ?? ""
             return "\(element.source)|\(element.role)|\(element.displayLabel)|\(element.value ?? "")|\(element.enabled)|\(element.focused)|\(box)"
         }.sorted().joined(separator: "\n")

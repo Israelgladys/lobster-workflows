@@ -167,3 +167,61 @@ private final class EmptyLayer: ActionLayer {
     func currentElements() async throws -> [AccessibilityElement] { [] }
     func perform(step: PlanStep) async throws -> StepOutcome { StepOutcome(status: "verified", detail: "", elements: []) }
 }
+
+@MainActor
+final class GoalStepTests: XCTestCase {
+    func testGoalStepsParseAndRequireAnOutcome() throws {
+        let goal = try PlanStep.parse(["action": "goal", "text": "The Skyfall album page is open"]).get()
+        XCTAssertEqual(goal.text, "The Skyfall album page is open")
+        XCTAssertEqual(goal.summary, "goal \"The Skyfall album page is open\"")
+        XCTAssertThrowsError(try PlanStep.parse(["action": "goal"]).get())
+    }
+
+    func testGoalRequestAsksDoneActionAndTargetInOneCall() throws {
+        var play = AccessibilityElement(id: 1, role: "AXButton", label: "Play", value: nil, enabled: true, actions: [], axElement: nil)
+        play.context = "Skyfall · Adele"
+        let heading = AccessibilityElement(id: 2, role: "AXStaticText", label: "Now playing: Hello", value: nil, enabled: true, actions: [], axElement: nil)
+        let prepared = try JevClient.goalRequest(goal: "Skyfall is playing", elements: [play, heading], appName: "Spotify", history: [])
+        let body = try JSONSerialization.jsonObject(with: prepared.data) as! [String: Any]
+        let questions = body["questions"] as! [String: [String: Any]]
+        XCTAssertEqual(Set(questions.keys), ["done", "operation", "click_target"])
+        XCTAssertNotNil((questions["operation"]!["criteria"] as! [String: String])["STUCK"])
+        XCTAssertEqual(Set(prepared.offered.keys), ["1"], "Only clickable controls are targets")
+        XCTAssertTrue(((body["state"] as! [String: Any])["screen"] as! String).contains("Now playing: Hello"), "Jev sees the screen to judge done")
+    }
+
+    func testGoalDecisionDecoding() throws {
+        let target = AccessibilityElement(id: 1, role: "AXButton", label: "Play", value: nil, enabled: true, actions: [], axElement: nil)
+        let click = try JevClient.decodeGoal(Data(#"{"answers":{"done":{"noul":0.1},"operation":{"choice":"CLICK"},"click_target":{"choice":"1"}}}"#.utf8), offered: ["1": target])
+        XCTAssertEqual(click.operation, "CLICK")
+        XCTAssertEqual(click.target?.id, 1)
+        let none = try JevClient.decodeGoal(Data(#"{"answers":{"operation":{"choice":"CLICK"},"click_target":{"choice":"__none__"}}}"#.utf8), offered: ["1": target])
+        XCTAssertEqual(none.operation, "STUCK", "A click with no target is stuck")
+        let done = try JevClient.decodeGoal(Data(#"{"answers":{"done":{"noul":0.9},"operation":{"choice":"WAIT"}}}"#.utf8), offered: [:])
+        XCTAssertGreaterThanOrEqual(done.done, JevClient.goalDoneThreshold)
+        XCTAssertThrowsError(try JevClient.decodeGoal(Data("{}".utf8), offered: [:]))
+    }
+
+    func testGoalStepsCanBeTurnedOffForExperiments() {
+        let enabled = CodexAgent.makeTools(actions: PlanStep.actions)
+        let disabled = CodexAgent.makeTools(actions: PlanStep.actions.filter { $0 != "goal" })
+        func actions(_ tools: [[String: Any]]) -> [String] {
+            let act = tools.first { $0["name"] as? String == "act" }!
+            let steps = ((act["parameters"] as! [String: Any])["properties"] as! [String: Any])["steps"] as! [String: Any]
+            return (((steps["items"] as! [String: Any])["properties"] as! [String: Any])["action"] as! [String: Any])["enum"] as! [String]
+        }
+        XCTAssertTrue(actions(enabled).contains("goal"))
+        XCTAssertFalse(actions(disabled).contains("goal"))
+        XCTAssertTrue(CodexAgent.baseInstructions.count < (CodexAgent.baseInstructions + CodexAgent.goalGuidance).count)
+    }
+
+    func testBenchmarkSummary() {
+        let rows: [[String: Any]] = [
+            ["state": "done", "total_ms": 8000, "codex_calls": 1, "jev_calls": 3, "actions": 4],
+            ["state": "failed", "total_ms": 20000, "codex_calls": 4, "jev_calls": 1, "actions": 6]
+        ]
+        let summary = Benchmark.summarize(rows, variant: "goals on")
+        XCTAssertTrue(summary.hasPrefix("Benchmark (goals on): 1/2 done · median 14.0s · codex 2.5 calls"))
+        XCTAssertNotNil(try? JSONEncoder().encode(Benchmark.sample))
+    }
+}

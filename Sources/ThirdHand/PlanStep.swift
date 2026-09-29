@@ -2,7 +2,7 @@ import Foundation
 
 /// One planner step with a fixed action, so grounding never has to guess what kind of input is meant.
 struct PlanStep: Equatable {
-    nonisolated static let actions = ["click", "type", "press", "scroll", "wait"]
+    nonisolated static let actions = ["click", "type", "press", "scroll", "wait", "goal"]
 
     let action: String
     var target: String? = nil
@@ -53,6 +53,12 @@ struct PlanStep: Equatable {
             }
             step.key = parsed.key
             step.modifiers = parsed.modifiers
+        case "goal":
+            // A goal is an outcome Jev works toward on its own; its description rides in `text`.
+            guard let goal = string("text"), goal.utf8.count <= 500 else {
+                return .failure(.invalid("A goal step needs a short description of the outcome in text."))
+            }
+            step.text = goal
         case "scroll":
             guard let direction = string("direction"), ["up", "down"].contains(direction) else {
                 return .failure(.invalid("A scroll step needs direction up or down."))
@@ -68,6 +74,7 @@ struct PlanStep: Equatable {
         case "press": return "press \((modifiers + [key ?? ""]).joined(separator: "+"))"
         case "scroll": return "scroll \(direction ?? "")" + (target.map { " in \"\($0)\"" } ?? "")
         case "wait": return "wait"
+        case "goal": return "goal \"\(text ?? "")\""
         default: return "\(action) \"\(target ?? "")\"" + (role.map { " (\($0))" } ?? "") + (near.map { " near \"\($0)\"" } ?? "")
         }
     }

@@ -217,6 +217,10 @@ final class ChatController: ObservableObject, TaskRunnerDelegate {
     private func end(state: TaskState, text: String) {
         guard let current else { return }
         self.current = nil
+        if current.runner != nil {
+            let metrics = RunMetrics.current.summary
+            store.updateMessage(current.job.messageID, in: current.job.threadID) { $0.metrics = metrics }
+        }
         finish(threadID: current.job.threadID, messageID: current.job.messageID, state: state, text: text,
                seconds: Date().timeIntervalSince(current.started))
         onTaskFinished()

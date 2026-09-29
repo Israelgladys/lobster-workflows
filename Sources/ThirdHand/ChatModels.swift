@@ -53,6 +53,8 @@ struct ChatMessage: Codable, Identifiable, Equatable {
     var awaiting: WaitingPrompt?
     /// Set when the task ran through the app's debugging connection, without the screen.
     var ranInBackground: Bool?
+    /// Timing and call counts from RunMetrics, for experiments.
+    var metrics: [String: Int]?
 }
 
 struct ChatThread: Codable, Identifiable, Equatable {

@@ -79,7 +79,9 @@ final class JevClient {
     nonisolated static func groundRequest(action: String, target: String, role: String?, near: String? = nil,
                                           candidates: [AccessibilityElement], allExact: Bool = false,
                                           appName: String) throws -> (data: Data, offered: [String: AccessibilityElement]) {
-        var selected = shortlist(candidates, target: (near.map { target + " " + $0 }) ?? target, role: role)
+        // Fewer, more relevant options choose better than hundreds when the label didn't match exactly.
+        var selected = Array(shortlist(candidates, target: (near.map { target + " " + $0 }) ?? target, role: role)
+            .prefix(allExact ? maxChoices - 1 : 60))
         let verb = action == "type" ? "type into" : "click"
         let described = (role.map { "the \($0) labelled \"\(target)\"" } ?? "the control labelled \"\(target)\"")
             + (near.map { " near \"\($0)\"" } ?? "")
@@ -101,7 +103,7 @@ final class JevClient {
                     "type": "choice", "criteria": criteria,
                     "instructions": allExact
                         ? "The planner wants to \(verb) \(described). Every element below has exactly that label; they differ only by where they are. Choose the one whose context best fits. Choose none only if the context clearly rules out all of them."
-                        : "The planner wants to \(verb) \(described). Which element is it? Labels may differ slightly in wording, case, or truncation. OCR text is only valid when it names that control. Choose none if no element plausibly is it."
+                        : "The planner wants to \(verb) \(described). It named the control by the text it expected, so the real label may be longer or phrased differently (for example \"Play <title> by <artist>\"), or be a row or item containing that text. Pick the element that best matches. OCR text is only valid when it names that control. Choose none only if nothing plausibly matches."
                 ] as [String: Any]]
             ]
             let data = try JSONSerialization.data(withJSONObject: body)
@@ -130,25 +132,114 @@ final class JevClient {
                 allExact: Bool = false, appName: String) async throws -> AccessibilityElement? {
         let prepared = try Self.groundRequest(action: action, target: target, role: role, near: near,
                                               candidates: candidates, allExact: allExact, appName: appName)
-        var request = URLRequest(url: endpoint, timeoutInterval: 15)
+        Log.info("Jev ground bytes=\(prepared.data.count) choices=\(prepared.offered.count + 1)")
+        let data = try await post(prepared.data, timeout: 15, message: "Target selection timed out.")
+        return try Self.decodeGround(data, offered: prepared.offered)
+    }
+
+    // MARK: - Goals
+
+    struct GoalDecision {
+        let done: Double
+        /// CLICK, SCROLL_DOWN, SCROLL_UP, PRESS_RETURN, PRESS_ESCAPE, WAIT, DONE, or STUCK.
+        let operation: String
+        let target: AccessibilityElement?
+    }
+
+    nonisolated static let goalDoneThreshold = 0.7
+    nonisolated static let goalScreenCharacters = 9_000
+
+    /// One call answers whether the goal is met, the next action, and its click target.
+    nonisolated static func goalRequest(goal: String, elements: [AccessibilityElement], appName: String,
+                                        history: [String]) throws -> (data: Data, offered: [String: AccessibilityElement]) {
+        let clickable = JevClient.targets(elements)
+        let ids = Set((clickable["CLICK"] ?? [:]).keys).union((clickable["CLICK_TEXT"] ?? [:]).keys)
+        let pool = elements.filter { ids.contains(String($0.id)) }
+        var selected = shortlist(pool, target: goal, role: nil)
+        var screen = CodexAgent.describe(elements)
+        if screen.count > goalScreenCharacters { screen = String(screen.prefix(goalScreenCharacters)) + "\n- …" }
+        let operations: [String: String] = [
+            "CLICK": "Click a control that moves toward the goal",
+            "SCROLL_DOWN": "Reveal more content below",
+            "SCROLL_UP": "Reveal content above",
+            "PRESS_RETURN": "Confirm or open the focused or selected item",
+            "PRESS_ESCAPE": "Dismiss a popup, menu, or dialog that is in the way",
+            "WAIT": "Content is still loading",
+            "DONE": "The goal is visibly complete on screen",
+            "STUCK": "Nothing on screen can advance the goal"
+        ]
+        while true {
+            var criteria: [String: String] = [:]
+            for element in selected {
+                var desc = String(element.displayLabel.prefix(120))
+                if let value = element.value, !value.isEmpty, value != element.label { desc += " = \(value.prefix(80))" }
+                desc += " [\(element.displayRole)]"
+                if let context = element.context { desc += " — in \"\(context.prefix(80))\"" }
+                criteria[String(element.id)] = desc
+            }
+            criteria[noneKey] = "None of these"
+            let body: [String: Any] = [
+                "model": "jev-latest",
+                "state": ["goal": goal, "app": String(appName.prefix(100)), "screen": screen,
+                          "actions_so_far": history.isEmpty ? ["none"] : Array(history.suffix(6))],
+                "questions": [
+                    "done": ["type": "noul", "instructions": "Is this goal visibly complete on the screen right now: \"\(goal)\"? Judge only by the screen."] as [String: Any],
+                    "operation": ["type": "choice", "criteria": operations,
+                                  "instructions": "Which single action moves toward \"\(goal)\"? Don't repeat an action that had no effect."] as [String: Any],
+                    "click_target": ["type": "choice", "criteria": criteria,
+                                     "instructions": "If clicking, which control should be clicked next to reach \"\(goal)\"?"] as [String: Any]
+                ] as [String: Any]
+            ]
+            let data = try JSONSerialization.data(withJSONObject: body)
+            if data.count <= maxRequestBytes {
+                return (data, Dictionary(uniqueKeysWithValues: selected.map { (String($0.id), $0) }))
+            }
+            if selected.count > 20 { selected = Array(selected.prefix(selected.count / 2)) }
+            else if screen.count > 1000 { screen = String(screen.prefix(screen.count / 2)) }
+            else { throw ControllerError.invalid("The screen is too large for the goal selector.") }
+        }
+    }
+
+    nonisolated static func decodeGoal(_ data: Data, offered: [String: AccessibilityElement]) throws -> GoalDecision {
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let answers = json["answers"] as? [String: Any],
+              let operation = (answers["operation"] as? [String: Any])?["choice"] as? String else {
+            throw ControllerError.invalid("Invalid Jev goal response")
+        }
+        let done = ((answers["done"] as? [String: Any])?["noul"] as? Double) ?? 0
+        guard operation == "CLICK" else { return GoalDecision(done: done, operation: operation, target: nil) }
+        let choice = (answers["click_target"] as? [String: Any])?["choice"] as? String
+        guard let choice, let target = offered[choice] else { return GoalDecision(done: done, operation: "STUCK", target: nil) }
+        return GoalDecision(done: done, operation: operation, target: target)
+    }
+
+    func decideGoal(goal: String, elements: [AccessibilityElement], appName: String, history: [String]) async throws -> GoalDecision {
+        let prepared = try Self.goalRequest(goal: goal, elements: elements, appName: appName, history: history)
+        let data = try await post(prepared.data, timeout: 15, message: "Goal step timed out.")
+        return try Self.decodeGoal(data, offered: prepared.offered)
+    }
+
+    private func post(_ body: Data, timeout: TimeInterval, message: String) async throws -> Data {
+        var request = URLRequest(url: endpoint, timeoutInterval: timeout)
         request.httpMethod = "POST"
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = prepared.data
-        Log.info("Jev ground bytes=\(prepared.data.count) choices=\(prepared.offered.count + 1)")
+        request.httpBody = body
         let start = Date()
-        let (data, response) = try await AsyncTimeout.run(seconds: 15, message: "Target selection timed out.") { [session] in
+        let (data, response) = try await AsyncTimeout.run(seconds: timeout, message: message) { [session] in
             try await session.data(for: request)
         }
         try Task.checkCancellation()
-        Log.info("Timing jev_ms=\(Int(Date().timeIntervalSince(start) * 1000))")
+        let ms = Int(Date().timeIntervalSince(start) * 1000)
+        RunMetrics.current.jev(ms: ms)
+        Log.info("Timing jev_ms=\(ms) bytes=\(body.count)")
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
             let code = (response as? HTTPURLResponse)?.statusCode ?? 0
             let detail = Self.errorDetail(data, redacting: apiKey)
             Log.info("Jev error HTTP \(code) detail=\(detail.replacingOccurrences(of: "\n", with: " "))")
             throw JevServiceError(status: code, detail: detail)
         }
-        return try Self.decodeGround(data, offered: prepared.offered)
+        return data
     }
 
     nonisolated static func errorDetail(_ data: Data, redacting key: String) -> String {

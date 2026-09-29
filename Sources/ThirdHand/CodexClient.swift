@@ -119,7 +119,9 @@ final class CodexClient {
             return try Self.collect(events)
         }
         try Task.checkCancellation()
-        Log.info("Timing codex_ms=\(Int(Date().timeIntervalSince(start) * 1000)) calls=\(response.functionCalls.count)")
+        let ms = Int(Date().timeIntervalSince(start) * 1000)
+        RunMetrics.current.codex(ms: ms)
+        Log.info("Timing codex_ms=\(ms) calls=\(response.functionCalls.count)")
         return response
     }
 

@@ -12,6 +12,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     private var apiKey: String?
     private var codexCredentials: CodexCredentials?
     let chat = ChatController()
+    lazy var benchmark = Benchmark(chat: chat)
     @Published var accessibilityReady = false
     @Published var shortcutReady = false
     @Published var screenReady = false

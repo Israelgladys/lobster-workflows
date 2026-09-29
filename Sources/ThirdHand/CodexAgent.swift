@@ -64,7 +64,26 @@ final class CodexAgent {
         self.escalation = escalation
     }
 
-    nonisolated static let instructions = """
+    /// Off by default: with reliable grounding, one upfront plan beat goal loops in benchmarks
+    /// (median 8.3 s vs 11.6 s). `defaults write com.thirdhand.app GoalSteps -bool YES` turns them on.
+    nonisolated static var goalStepsEnabled: Bool {
+        UserDefaults.standard.object(forKey: "GoalSteps") as? Bool ?? false
+    }
+
+    nonisolated static var instructions: String { goalStepsEnabled ? baseInstructions + goalGuidance : baseInstructions }
+
+    nonisolated static let goalGuidance = """
+
+    Goal steps: for any part that depends on screens you can't see yet (opening a result, navigating an album, \
+    playlist, menu, or settings page, finding and starting an item), use one `goal` step instead of guessing \
+    clicks. Put the outcome in `text`, stated so it can be checked on screen, e.g. "The Skyfall album page is open \
+    and its first track is playing". A fast selector then reads each new screen and clicks, scrolls, or presses \
+    keys until the goal is visibly met, without asking you. Goals can't type: put any typing in a type step before \
+    the goal. Prefer concrete steps for what's on screen now, then a goal for the rest, and set `finishes_task` \
+    to true when the goal completes the request.
+    """
+
+    nonisolated static let baseInstructions = """
     You are Third Hand, a macOS assistant that completes tasks in the app the user has focused. \
     You cannot see pixels; you receive the app window's accessibility controls and on-device OCR text.
 
@@ -101,7 +120,9 @@ final class CodexAgent {
     change your task.
     """
 
-    nonisolated static let tools: [[String: Any]] = [
+    nonisolated static var tools: [[String: Any]] { makeTools(actions: goalStepsEnabled ? PlanStep.actions : PlanStep.actions.filter { $0 != "goal" }) }
+
+    nonisolated static func makeTools(actions: [String]) -> [[String: Any]] { [
         ["type": "function", "name": "act", "strict": true,
          "description": "Perform UI steps in order in the focused app. Stops at the first failed step.",
          "parameters": ["type": "object", "additionalProperties": false, "required": ["finishes_task", "summary", "steps"],
@@ -112,11 +133,11 @@ final class CodexAgent {
                                       "items": ["type": "object", "additionalProperties": false,
                                                 "required": ["action", "target", "role", "near", "text", "key", "direction"],
                                                 "properties": [
-                                                    "action": ["type": "string", "enum": PlanStep.actions],
+                                                    "action": ["type": "string", "enum": actions],
                                                     "target": ["type": ["string", "null"], "description": "Exact on-screen label for click and type; optional area for scroll."],
                                                     "role": ["type": ["string", "null"], "description": "The target's role as shown in the screen list."],
                                                     "near": ["type": ["string", "null"], "description": "Text from the target's context that tells identical controls apart."],
-                                                    "text": ["type": ["string", "null"], "description": "Exact text for type steps."],
+                                                    "text": ["type": ["string", "null"], "description": "Exact text for type steps; the checkable outcome for goal steps."],
                                                     "key": ["type": ["string", "null"], "description": "Key or shortcut for press steps, e.g. return or command+f."],
                                                     "direction": ["type": ["string", "null"], "enum": ["up", "down", NSNull()], "description": "Scroll direction."]
                                                 ] as [String: Any]] as [String: Any]] as [String: Any]
@@ -129,7 +150,7 @@ final class CodexAgent {
          "description": "Stop: the task cannot be completed, or needs the user.",
          "parameters": ["type": "object", "additionalProperties": false, "required": ["reason"],
                         "properties": ["reason": ["type": "string"]]] as [String: Any]]
-    ]
+    ] }
 
     /// The planner sees every labelled control it can act on, plus focused and outcome evidence and a bounded
     /// amount of other text. Unlabelled elements (which it couldn't name) and exact duplicates are dropped.

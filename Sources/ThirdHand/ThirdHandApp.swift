@@ -17,6 +17,22 @@ struct ThirdHandApp: App {
                 }
                 .keyboardShortcut("n")
             }
+            CommandMenu("Debug") {
+                Button("Run Benchmark") {
+                    appDelegate.showMain()
+                    Task { await appDelegate.benchmark.run() }
+                }
+                .keyboardShortcut("b", modifiers: [.command, .option])
+                Button("Edit Benchmark Tasks…") {
+                    if let url = Benchmark.specURL {
+                        _ = try? appDelegate.benchmark.loadSpec()
+                        NSWorkspace.shared.open(url)
+                    }
+                }
+                Button("Show Benchmark Results") {
+                    NSWorkspace.shared.activateFileViewerSelecting([Benchmark.resultsURL])
+                }
+            }
             CommandGroup(after: .windowList) {
                 Button("Third Hand") { appDelegate.showMain() }
                     .keyboardShortcut("0")

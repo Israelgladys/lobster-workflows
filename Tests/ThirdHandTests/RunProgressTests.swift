@@ -88,6 +88,16 @@ final class RunProgressTests: XCTestCase {
         }
     }
 
+    func testPlaybackProgressIsNotEvidenceOfAnEffect() {
+        func el(_ role: String, _ label: String, value: String? = nil) -> AccessibilityElement {
+            AccessibilityElement(id: 1, role: role, label: label, value: value, enabled: true, actions: [], axElement: nil)
+        }
+        let before = [el("AXButton", "Play"), el("AXStaticText", "1:23"), el("AXSlider", "Progress", value: "83")]
+        let after = [el("AXButton", "Play"), el("AXStaticText", "1:24"), el("AXSlider", "Progress", value: "84")]
+        XCTAssertEqual(ObservationState.signature(before), ObservationState.signature(after))
+        XCTAssertNotEqual(ObservationState.signature(before), ObservationState.signature([el("AXButton", "Pause")]))
+    }
+
     func testDebugPortRequiresExplicitValidFlag() {
         XCTAssertNil(ElectronDetector.debugPort(in: "Electron"))
         XCTAssertNil(ElectronDetector.debugPort(in: "Electron --remote-debugging-port=0"))
