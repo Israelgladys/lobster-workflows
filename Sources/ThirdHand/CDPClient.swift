@@ -7,13 +7,17 @@ final class CDPClient {
     private var nextId = 1
     private let session: URLSession
     private var expectedFrame: CGRect?
+    /// Background control drives an unfocused window, so the page need not have focus.
+    private var requireFocus = true
+    /// Viewport rectangles from the latest extraction, keyed by element id.
+    private var viewportRects: [Int: CGRect] = [:]
 
     init(port: Int, session: URLSession = .shared) {
         self.port = port
         self.session = session
     }
 
-    func connect(windowFrame: CGRect) async throws {
+    func connect(windowFrame: CGRect, requireFocus: Bool = true) async throws {
         struct Target: Decodable {
             let id: String
             let type: String
@@ -26,18 +30,26 @@ final class CDPClient {
         }
         let targets = try JSONDecoder().decode([Target].self, from: data)
         let pages = targets.filter { $0.type == "page" }
-        guard pages.count == 1, let page = pages.first,
-              let wsUrlString = page.webSocketDebuggerUrl,
-              let wsUrl = URL(string: wsUrlString), wsUrl.scheme == "ws",
-              ["localhost", "127.0.0.1", "[::1]"].contains(wsUrl.host ?? ""), wsUrl.port == port else {
-            throw ControllerError.invalid("Browser target is missing or ambiguous; using accessibility.")
-        }
-        webSocket = session.webSocketTask(with: wsUrl)
-        webSocket?.resume()
-        _ = try await send(method: "Runtime.enable")
+        self.requireFocus = requireFocus
         expectedFrame = windowFrame
-        _ = try await extractElements()
-        Log.info("CDP connected to the verified focused page")
+        // Use the page whose window matches the app's window; apps can host several pages.
+        for page in pages {
+            guard let wsUrlString = page.webSocketDebuggerUrl,
+                  let wsUrl = URL(string: wsUrlString), wsUrl.scheme == "ws",
+                  ["localhost", "127.0.0.1", "[::1]"].contains(wsUrl.host ?? ""), wsUrl.port == port else { continue }
+            webSocket = session.webSocketTask(with: wsUrl)
+            webSocket?.resume()
+            do {
+                _ = try await send(method: "Runtime.enable")
+                _ = try await extractElements()
+                Log.info("CDP connected to the verified page focus_required=\(requireFocus) pages=\(pages.count)")
+                return
+            } catch {
+                Log.info("CDP page rejected error=\(error.localizedDescription)")
+                disconnect()
+            }
+        }
+        throw ControllerError.invalid(pages.isEmpty ? "The app has no page to control yet." : "The app's page doesn't match its window yet.")
     }
 
     func disconnect() {
@@ -58,7 +70,7 @@ final class CDPClient {
             throw ControllerError.invalid("CDP DOM extraction returned no data")
         }
         let snapshot = try JSONDecoder().decode(DOMSnapshot.self, from: data)
-        guard let expectedFrame, snapshot.screen.focused,
+        guard let expectedFrame, snapshot.screen.focused || !requireFocus,
               abs(snapshot.screen.x - expectedFrame.minX) < 8,
               abs(snapshot.screen.y - expectedFrame.minY) < 8,
               abs(snapshot.screen.width - expectedFrame.width) < 8,
@@ -67,6 +79,9 @@ final class CDPClient {
         }
         let originX = snapshot.screen.x
         let originY = snapshot.screen.y
+        viewportRects = Dictionary(uniqueKeysWithValues: snapshot.elements.map {
+            ($0.id, CGRect(x: $0.rect.x, y: $0.rect.y, width: $0.rect.w, height: $0.rect.h))
+        })
         return snapshot.elements.map { el in
             AccessibilityElement(
                 id: el.id,
@@ -85,6 +100,74 @@ final class CDPClient {
         }
     }
 
+    // MARK: - Background input
+    // DevTools input events go to the page itself, so they work while the window isn't in front.
+
+    func click(id: Int, count: Int = 1) async throws {
+        guard let rect = viewportRects[id] else { throw ControllerError.invalid("The selected control is no longer on the page.") }
+        let point: [String: Any] = ["x": rect.midX, "y": rect.midY]
+        _ = try await send(method: "Input.dispatchMouseEvent", params: point.merging(["type": "mouseMoved"]) { a, _ in a })
+        for click in 1...count {
+            let base = point.merging(["button": "left", "clickCount": click]) { a, _ in a }
+            _ = try await send(method: "Input.dispatchMouseEvent", params: base.merging(["type": "mousePressed"]) { a, _ in a })
+            _ = try await send(method: "Input.dispatchMouseEvent", params: base.merging(["type": "mouseReleased"]) { a, _ in a })
+        }
+    }
+
+    /// Focuses the tagged field, selects its contents, and replaces them with `text`.
+    func replaceText(id: Int, text: String) async throws {
+        let result = try await send(method: "Runtime.evaluate", params: [
+            "expression": """
+            (() => {
+                const el = document.querySelector('[data-th-id="\(id)"]');
+                if (!el) return false;
+                el.focus();
+                if (typeof el.select === 'function') el.select();
+                else document.execCommand('selectAll');
+                return document.activeElement === el || el.contains(document.activeElement);
+            })()
+            """,
+            "returnByValue": true
+        ])
+        guard (result["result"] as? [String: Any])?["value"] as? Bool == true else {
+            throw ControllerError.invalid("The selected field couldn't be focused in the background.")
+        }
+        _ = try await send(method: "Input.insertText", params: ["text": text])
+    }
+
+    nonisolated static func keyEvent(_ key: String, modifiers: [String]) -> [String: Any]? {
+        let named: [String: (key: String, code: String, keyCode: Int, text: String?)] = [
+            "return": ("Enter", "Enter", 13, "\r"), "tab": ("Tab", "Tab", 9, nil), "escape": ("Escape", "Escape", 27, nil),
+            "space": (" ", "Space", 32, " "), "delete": ("Backspace", "Backspace", 8, nil),
+            "left": ("ArrowLeft", "ArrowLeft", 37, nil), "right": ("ArrowRight", "ArrowRight", 39, nil),
+            "up": ("ArrowUp", "ArrowUp", 38, nil), "down": ("ArrowDown", "ArrowDown", 40, nil)
+        ]
+        let mask = modifiers.reduce(0) { $0 | (["option": 1, "control": 2, "command": 4, "shift": 8][$1] ?? 0) }
+        if let spec = named[key] {
+            var event: [String: Any] = ["key": spec.key, "code": spec.code, "windowsVirtualKeyCode": spec.keyCode, "modifiers": mask]
+            if let text = spec.text, mask & 7 == 0 { event["text"] = text }
+            return event
+        }
+        guard key.count == 1, let scalar = key.uppercased().unicodeScalars.first, scalar.isASCII else { return nil }
+        let isDigit = CharacterSet.decimalDigits.contains(scalar)
+        var event: [String: Any] = ["key": key, "code": isDigit ? "Digit\(key)" : "Key\(key.uppercased())",
+                                    "windowsVirtualKeyCode": Int(scalar.value), "modifiers": mask]
+        if mask & 7 == 0 { event["text"] = mask & 8 != 0 ? key.uppercased() : key }
+        return event
+    }
+
+    func press(_ key: String, modifiers: [String]) async throws {
+        guard let event = Self.keyEvent(key, modifiers: modifiers) else { throw ControllerError.invalid("Unsupported key for background control.") }
+        _ = try await send(method: "Input.dispatchKeyEvent", params: event.merging(["type": event["text"] == nil ? "rawKeyDown" : "keyDown"]) { a, _ in a })
+        _ = try await send(method: "Input.dispatchKeyEvent", params: event.merging(["type": "keyUp"]) { a, _ in a })
+    }
+
+    func scroll(deltaY: Double, at id: Int?) async throws {
+        let rect = id.flatMap { viewportRects[$0] }
+        let x = rect?.midX ?? 400, y = rect?.midY ?? 300
+        _ = try await send(method: "Input.dispatchMouseEvent", params: ["type": "mouseWheel", "x": x, "y": y, "deltaX": 0, "deltaY": deltaY])
+    }
+
     // MARK: - WebSocket transport
 
     private func send(method: String, params: [String: Any] = [:]) async throws -> [String: Any] {
@@ -99,7 +182,8 @@ final class CDPClient {
         nextId += 1
         let message: [String: Any] = ["id": id, "method": method, "params": params]
         let data = try JSONSerialization.data(withJSONObject: message)
-        try await ws.send(.data(data))
+        // The DevTools protocol only accepts text frames; a binary frame resets the connection.
+        try await ws.send(.string(String(decoding: data, as: UTF8.self)))
         let deadline = Date().addingTimeInterval(10)
         while Date() < deadline {
             try Task.checkCancellation()
@@ -152,6 +236,8 @@ final class CDPClient {
         const results = [];
         let nextId = 1;
         const LIMIT = 500;
+        // Tag reported elements so background input can target them by id.
+        document.querySelectorAll('[data-th-id]').forEach(el => el.removeAttribute('data-th-id'));
 
         const TAG_ROLES = {
             A:'AXLink', BUTTON:'AXButton', SELECT:'AXPopUpButton',
@@ -223,6 +309,7 @@ final class CDPClient {
                 const v = node.value
                     || node.getAttribute('aria-valuenow') || null;
                 if (l || v) {
+                    node.setAttribute('data-th-id', String(nextId));
                     results.push({
                         id: nextId++, role: axRole, label: l, value: v,
                         enabled: !node.disabled

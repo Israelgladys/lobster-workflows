@@ -153,7 +153,9 @@ private struct ThreadRow: View {
                 }
             }
             Spacer(minLength: 0)
-            if thread.messages.contains(where: { $0.state == .running }) {
+            if thread.messages.contains(where: { $0.state == .waiting }) {
+                Image(systemName: "hourglass").font(.system(size: 10)).foregroundStyle(Theme.accent)
+            } else if thread.messages.contains(where: { $0.state == .running }) {
                 ProgressView().controlSize(.mini)
             }
         }
@@ -187,9 +189,9 @@ private struct ThreadView: View {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 20) {
                         ForEach(thread.messages) { message in
-                            MessageRow(message: message, catalog: chat.catalog) {
-                                chat.stop(messageID: message.id, in: thread.id)
-                            }
+                            MessageRow(message: message, catalog: chat.catalog,
+                                       onStop: { chat.stop(messageID: message.id, in: thread.id) },
+                                       onChoose: { chat.choose($0, messageID: message.id) })
                             .id(message.id)
                         }
                     }
@@ -214,6 +216,7 @@ private struct MessageRow: View {
     let message: ChatMessage
     let catalog: AppCatalog
     let onStop: () -> Void
+    let onChoose: (ChatController.ScreenChoice) -> Void
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
@@ -225,6 +228,7 @@ private struct MessageRow: View {
                     if let seconds = message.seconds, message.state == .done {
                         Text(String(format: "· %.0fs", seconds)).font(.system(size: 11)).foregroundStyle(Theme.tertiary)
                     }
+                    if message.role == .task, let chip = modeChip { chip }
                 }
                 if message.role == .user {
                     Text(Self.highlighted(message.text)).font(.system(size: 14)).lineSpacing(2).textSelection(.enabled)
@@ -264,6 +268,12 @@ private struct MessageRow: View {
             .padding(.horizontal, 12).padding(.vertical, 8)
             .background(RoundedRectangle(cornerRadius: 9).fill(Theme.surface))
             .overlay(RoundedRectangle(cornerRadius: 9).stroke(Theme.border))
+        case .waiting:
+            if message.awaiting == .relaunch {
+                RelaunchCard(message: message, onChoose: onChoose, onStop: onStop)
+            } else {
+                TakeoverCard(message: message, onChoose: onChoose, onStop: onStop)
+            }
         case .done:
             result(icon: "checkmark", color: Theme.success, text: message.text)
         case .failed:
@@ -273,6 +283,24 @@ private struct MessageRow: View {
         case nil:
             Text(message.text).font(.system(size: 14))
         }
+    }
+
+    /// How the task used (or will use) the screen.
+    private var modeChip: AnyView? {
+        guard let mode = message.mode else { return nil }
+        let (label, symbol): (String, String) = {
+            if message.ranInBackground == true { return ("Background", "moon") }
+            if message.waitedForIdle == true { return ("On screen · after idle", "moon.zzz") }
+            return (mode.label, mode.symbol)
+        }()
+        return AnyView(
+            Label(label, systemImage: symbol)
+                .font(.system(size: 10, weight: .medium))
+                .foregroundStyle(Theme.secondary)
+                .padding(.horizontal, 7).padding(.vertical, 2)
+                .background(Capsule().fill(Theme.surface))
+                .overlay(Capsule().stroke(Theme.border))
+        )
     }
 
     private func result(icon: String, color: Color, text: String) -> some View {
@@ -346,6 +374,12 @@ private struct Composer: View {
                     .lineLimit(1...6)
                     .focused($focused)
                     .onSubmit(submit)
+                    .onKeyPress(.return, phases: .down) { press in
+                        // Return runs on screen (onSubmit); ⇧Return runs in the background.
+                        guard press.modifiers.contains(.shift), suggestions.isEmpty else { return .ignored }
+                        send(mode: .background)
+                        return .handled
+                    }
                     .onKeyPress(.upArrow) { move(-1) }
                     .onKeyPress(.downArrow) { move(1) }
                     .onKeyPress(.tab) {
@@ -367,6 +401,11 @@ private struct Composer: View {
             .padding(.leading, 14).padding(.trailing, 8).padding(.vertical, 8)
             .background(RoundedRectangle(cornerRadius: 14).fill(Theme.surface))
             .overlay(RoundedRectangle(cornerRadius: 14).stroke(focused ? Theme.tertiary : Theme.border))
+            HStack(spacing: 14) {
+                KeyHint(keys: "↩", text: "run on screen")
+                KeyHint(keys: "⇧↩", text: "run in background")
+            }
+            .padding(.leading, 4)
         }
         .padding(.horizontal, 24).padding(.bottom, 20).padding(.top, 4)
         .onAppear { focusAtEnd() }
@@ -395,7 +434,12 @@ private struct Composer: View {
 
     private func submit() {
         if let entry = suggestions[safe: highlighted] { complete(with: entry); return }
-        chat.send(in: threadID)
+        send(mode: .onScreen)
+    }
+
+    private func send(mode: ExecutionMode) {
+        guard canSend else { return }
+        chat.send(in: threadID, mode: mode)
         focused = true
     }
 
@@ -404,6 +448,88 @@ private struct Composer: View {
         if let at = text.lastIndex(of: "@") { text = String(text[..<at]) }
         draft.wrappedValue = text + "@\(entry.name) "
         focused = true
+    }
+}
+
+// MARK: - Screen use
+
+private struct TakeoverCard: View {
+    let message: ChatMessage
+    let onChoose: (ChatController.ScreenChoice) -> Void
+    let onStop: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                Image(systemName: "moon.zzz").font(.system(size: 12)).foregroundStyle(Theme.accent)
+                Text("\(message.app?.name ?? "This app") needs the screen").font(.system(size: 13, weight: .semibold))
+            }
+            if let plan = message.plan, !plan.isEmpty {
+                VStack(alignment: .leading, spacing: 4) {
+                    ForEach(Array(plan.enumerated()), id: \.offset) { index, step in
+                        HStack(alignment: .firstTextBaseline, spacing: 8) {
+                            Text("\(index + 1)").font(.system(size: 11, weight: .semibold).monospacedDigit()).foregroundStyle(Theme.tertiary)
+                            Text(step).font(.system(size: 12)).foregroundStyle(Theme.secondary)
+                        }
+                    }
+                }
+            }
+            Text("\(message.app?.name ?? "This app") can't be controlled in the background, so this will use the screen when you step away.")
+                .font(.system(size: 12)).foregroundStyle(Theme.secondary)
+            HStack(spacing: 8) {
+                Button("Take over now") { onChoose(.now) }.buttonStyle(PillButtonStyle(prominent: true))
+                Button("Cancel", action: onStop).buttonStyle(PillButtonStyle())
+                Spacer()
+                Text(message.status ?? "").font(.system(size: 11)).foregroundStyle(Theme.tertiary)
+            }
+        }
+        .padding(14)
+        .frame(maxWidth: 520, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 12).fill(Theme.surface))
+        .overlay(RoundedRectangle(cornerRadius: 12).stroke(Theme.border))
+    }
+}
+
+private struct RelaunchCard: View {
+    let message: ChatMessage
+    let onChoose: (ChatController.ScreenChoice) -> Void
+    let onStop: () -> Void
+
+    var body: some View {
+        let name = message.app?.name ?? "This app"
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                Image(systemName: "arrow.clockwise").font(.system(size: 12, weight: .semibold)).foregroundStyle(Theme.accent)
+                Text("Relaunch \(name) for background control?").font(.system(size: 13, weight: .semibold))
+            }
+            Text("\(name) will quit and reopen with a local debugging connection, so Third Hand can work in it without taking over your screen. Anything playing or unsaved in \(name) stops. While it's open this way, other apps on this Mac could connect to it too.")
+                .font(.system(size: 12)).foregroundStyle(Theme.secondary).lineSpacing(2)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 8) {
+                Button("Relaunch \(name)") { onChoose(.relaunch) }.buttonStyle(PillButtonStyle(prominent: true))
+                Button("Run on screen instead") { onChoose(.onScreenInstead) }.buttonStyle(PillButtonStyle())
+                Button("Cancel", action: onStop).buttonStyle(PillButtonStyle())
+            }
+        }
+        .padding(14)
+        .frame(maxWidth: 520, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 12).fill(Theme.surface))
+        .overlay(RoundedRectangle(cornerRadius: 12).stroke(Theme.border))
+    }
+}
+
+private struct KeyHint: View {
+    let keys: String
+    let text: String
+
+    var body: some View {
+        HStack(spacing: 5) {
+            Text(keys).font(.system(size: 10, weight: .semibold))
+                .padding(.horizontal, 4).padding(.vertical, 1)
+                .background(RoundedRectangle(cornerRadius: 3).stroke(Theme.border))
+            Text(text).font(.system(size: 10))
+        }
+        .foregroundStyle(Theme.tertiary)
     }
 }
 

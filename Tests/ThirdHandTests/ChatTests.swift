@@ -1,3 +1,4 @@
+import AppKit
 import XCTest
 @testable import ThirdHand
 
@@ -68,6 +69,87 @@ final class ChatTests: XCTestCase {
         XCTAssertTrue(opening.hasPrefix("Earlier in this chat"))
         XCTAssertTrue(opening.contains("search Adele → done: Searched."))
         XCTAssertTrue(opening.contains("Task: play the first song"))
+    }
+}
+
+@MainActor
+final class ScreenGateTests: XCTestCase {
+    func testPlanIsOfferedBeforeAnyStepRuns() async throws {
+        let layer = GateLayer()
+        _ = try await CodexAgent(planner: OnePlan(), tier: .quick).run(goal: "g", appName: "Spotify", layer: layer)
+        XCTAssertEqual(layer.events, ["prepare:2", "perform:type", "perform:press"])
+    }
+
+    func testDecliningTheScreenSendsNoInput() async {
+        let layer = GateLayer()
+        layer.decline = true
+        do {
+            _ = try await CodexAgent(planner: OnePlan(), tier: .quick).run(goal: "g", appName: "Spotify", layer: layer)
+            XCTFail("Cancelling at the take-over card stops the task")
+        } catch is CancellationError {} catch { XCTFail("Unexpected error \(error)") }
+        XCTAssertEqual(layer.events, ["prepare:2"])
+    }
+
+    func testOldMessagesWithoutModeStillDecode() throws {
+        let json = #"[{"id":"4F0E2C1E-0000-0000-0000-000000000000","title":"t","messages":[{"id":"4F0E2C1E-0000-0000-0000-000000000001","date":0,"role":"task","text":"ok","state":"done"}],"updated":0}]"#
+        let threads = try JSONDecoder().decode([ChatThread].self, from: Data(json.utf8))
+        XCTAssertNil(threads[0].messages[0].mode)
+    }
+
+    func testRemovedAutoModeDecodesAsOnScreen() throws {
+        let decoded = try JSONDecoder().decode([ExecutionMode].self, from: Data(#"["auto","background","onScreen"]"#.utf8))
+        XCTAssertEqual(decoded, [.onScreen, .background, .onScreen])
+    }
+
+    func testBackgroundKeyEvents() {
+        let enter = CDPClient.keyEvent("return", modifiers: [])
+        XCTAssertEqual(enter?["key"] as? String, "Enter")
+        XCTAssertEqual(enter?["windowsVirtualKeyCode"] as? Int, 13)
+        XCTAssertEqual(enter?["text"] as? String, "\r")
+        let find = CDPClient.keyEvent("f", modifiers: ["command"])
+        XCTAssertEqual(find?["code"] as? String, "KeyF")
+        XCTAssertEqual(find?["modifiers"] as? Int, 4)
+        XCTAssertNil(find?["text"], "Shortcuts don't insert text")
+        XCTAssertEqual(CDPClient.keyEvent("a", modifiers: ["shift"])?["text"] as? String, "A")
+        XCTAssertNil(CDPClient.keyEvent("f13", modifiers: []))
+    }
+
+    func testChromiumAppsSupportBackgroundDebugging() {
+        let spotifyInstalled = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.spotify.client") != nil
+        if spotifyInstalled { XCTAssertTrue(ElectronDetector.supportsDebugging(bundleID: "com.spotify.client")) }
+        XCTAssertFalse(ElectronDetector.supportsDebugging(bundleID: "com.apple.calculator"))
+        XCTAssertEqual(ElectronDetector.debuggingArguments(port: 9333),
+                       ["--remote-debugging-port=9333", "--remote-debugging-address=127.0.0.1"], "Loopback only")
+        let port = ElectronDetector.freePort()
+        XCTAssertNotNil(port)
+        XCTAssertGreaterThan(port ?? 0, 1024)
+    }
+}
+
+@MainActor
+private final class OnePlan: Planner {
+    func respond(model: String, instructions: String, input: [[String: Any]], tools: [[String: Any]], effort: String) async throws -> CodexResponse {
+        let steps: [[String: Any]] = [
+            ["action": "type", "target": "Search", "role": "textField", "text": "adele", "key": NSNull(), "direction": NSNull()],
+            ["action": "press", "target": NSNull(), "role": NSNull(), "text": NSNull(), "key": "return", "direction": NSNull()]
+        ]
+        let args = String(decoding: try JSONSerialization.data(withJSONObject: ["finishes_task": true, "summary": "Searched.", "steps": steps]), as: UTF8.self)
+        return CodexResponse(output: [["type": "function_call", "call_id": "c", "name": "act", "arguments": args]])
+    }
+}
+
+@MainActor
+private final class GateLayer: ActionLayer {
+    var events: [String] = []
+    var decline = false
+    func currentElements() async throws -> [AccessibilityElement] { [] }
+    func prepare(for steps: [PlanStep]) async throws {
+        events.append("prepare:\(steps.count)")
+        if decline { throw CancellationError() }
+    }
+    func perform(step: PlanStep) async throws -> StepOutcome {
+        events.append("perform:\(step.action)")
+        return StepOutcome(status: "verified", detail: "", elements: [])
     }
 }
 

@@ -6,7 +6,30 @@ struct ChatApp: Codable, Hashable {
 }
 
 enum TaskState: String, Codable {
-    case queued, running, done, failed, stopped
+    /// `waiting` means the plan is ready and the task is waiting to use the screen.
+    case queued, running, waiting, done, failed, stopped
+}
+
+/// How a task may use the screen. Return sends on screen, ⇧Return in the background: Chromium apps
+/// run through a debugging connection, and other apps borrow the screen once the user is idle.
+enum ExecutionMode: String, Codable {
+    case onScreen, background
+
+    init(from decoder: Decoder) throws {
+        // Older builds also stored "auto", which always ended up on screen.
+        self = ExecutionMode(rawValue: try decoder.singleValueContainer().decode(String.self)) ?? .onScreen
+    }
+
+    var label: String { self == .background ? "Background" : "On screen" }
+    var symbol: String { self == .background ? "moon" : "display" }
+}
+
+/// What a waiting task's card asks for.
+enum WaitingPrompt: String, Codable {
+    /// Borrow the screen (background mode in apps without background control).
+    case screen
+    /// Relaunch a Chromium app with a debugging port for background control.
+    case relaunch
 }
 
 struct ChatMessage: Codable, Identifiable, Equatable {
@@ -22,6 +45,14 @@ struct ChatMessage: Codable, Identifiable, Equatable {
     /// Live progress while a task runs.
     var status: String?
     var seconds: Double?
+    var mode: ExecutionMode?
+    /// The planned steps shown while a task waits for the screen.
+    var plan: [String]?
+    /// Set when the task waited for the user to be idle before using the screen.
+    var waitedForIdle: Bool?
+    var awaiting: WaitingPrompt?
+    /// Set when the task ran through the app's debugging connection, without the screen.
+    var ranInBackground: Bool?
 }
 
 struct ChatThread: Codable, Identifiable, Equatable {
@@ -47,7 +78,7 @@ final class ThreadStore: ObservableObject {
             // A task can't still be running after a relaunch.
             threads = saved.map { thread in
                 var thread = thread
-                for index in thread.messages.indices where [.queued, .running].contains(thread.messages[index].state) {
+                for index in thread.messages.indices where [.queued, .running, .waiting].contains(thread.messages[index].state) {
                     thread.messages[index].state = .stopped
                     thread.messages[index].status = nil
                     thread.messages[index].text = "Stopped when Third Hand quit."

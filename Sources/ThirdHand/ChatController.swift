@@ -9,6 +9,11 @@ final class ChatController: ObservableObject, TaskRunnerDelegate {
     @Published var drafts: [UUID: String] = [:]
     /// Bumped to move keyboard focus to the composer.
     @Published var focusRequest = 0
+    /// Choices on a waiting task's card: take over the screen now, relaunch for background
+    /// control, or give up on the background and run on screen.
+    enum ScreenChoice { case now, relaunch, onScreenInstead }
+    private var screenChoices: [UUID: ScreenChoice] = [:]
+    nonisolated static let idleThreshold: TimeInterval = 20
 
     /// Supplies credentials at send time; nil means setup isn't finished.
     var credentials: () -> (apiKey: String, codex: CodexCredentials)? = { nil }
@@ -22,6 +27,7 @@ final class ChatController: ObservableObject, TaskRunnerDelegate {
         let messageID: UUID
         let app: ChatApp
         let prompt: String
+        let mode: ExecutionMode
     }
 
     private var queue: [Job] = []
@@ -44,7 +50,8 @@ final class ChatController: ObservableObject, TaskRunnerDelegate {
 
     // MARK: - Sending
 
-    func send(in threadID: UUID) {
+    /// Sends the draft: Return runs on screen, ⇧Return in the background.
+    func send(in threadID: UUID, mode: ExecutionMode = .onScreen) {
         let draft = (drafts[threadID] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         guard !draft.isEmpty else { return }
         let parsed = MentionParser.parse(draft, appNames: catalog.all.map(\.name))
@@ -62,9 +69,9 @@ final class ChatController: ObservableObject, TaskRunnerDelegate {
             store.append(ChatMessage(role: .task, text: "Tell me what to do in \(app.name).", app: app, state: .failed), to: threadID)
             return
         }
-        let message = ChatMessage(role: .task, text: "", app: app, state: .queued, status: "Waiting for the current task…")
+        let message = ChatMessage(role: .task, text: "", app: app, state: .queued, status: "Waiting for the current task…", mode: mode)
         store.append(message, to: threadID)
-        queue.append(Job(threadID: threadID, requestID: request.id, messageID: message.id, app: app, prompt: parsed.prompt))
+        queue.append(Job(threadID: threadID, requestID: request.id, messageID: message.id, app: app, prompt: parsed.prompt, mode: mode))
         startNext()
     }
 
@@ -102,14 +109,21 @@ final class ChatController: ObservableObject, TaskRunnerDelegate {
         setStatus(running ? "Reading \(job.app.name)…" : "Opening \(job.app.name)…")
         current?.task = Task { [weak self] in
             do {
-                let app = try await AppCatalog.prepare(job.app)
-                guard let self, self.current?.job.messageID == job.messageID else { return }
+                guard let self else { return }
+                let (app, background) = try await self.launch(for: job)
+                guard self.current?.job.messageID == job.messageID else { return }
                 guard let target = AppTarget.make(from: app) else {
                     throw ControllerError.invalid("\(job.app.name) can't be controlled.")
                 }
+                if background { self.store.updateMessage(job.messageID, in: job.threadID) { $0.ranInBackground = true } }
                 let runner = TaskRunner(target: target, goal: job.prompt, apiKey: credentials.apiKey,
-                                        credentials: credentials.codex, context: context)
+                                        credentials: credentials.codex, context: context, background: background)
                 runner.delegate = self
+                let waitForIdle = job.mode == .background && !background
+                runner.requestScreen = { [weak self] steps in
+                    guard let self else { throw CancellationError() }
+                    if waitForIdle { try await self.awaitIdle(for: job, steps: steps) }
+                }
                 self.current?.runner = runner
                 runner.start()
             } catch is CancellationError {
@@ -118,6 +132,77 @@ final class ChatController: ObservableObject, TaskRunnerDelegate {
                 self.end(state: .failed, text: error.localizedDescription)
             }
         }
+    }
+
+    func choose(_ choice: ScreenChoice, messageID: UUID) {
+        screenChoices[messageID] = choice
+    }
+
+    /// Opens the app for the task. A background task in a Chromium app runs through its debugging
+    /// connection, relaunching the app first if the user agrees; other apps run on screen.
+    private func launch(for job: Job) async throws -> (NSRunningApplication, background: Bool) {
+        guard job.mode == .background, ElectronDetector.supportsDebugging(bundleID: job.app.bundleID) else {
+            return (try await AppCatalog.prepare(job.app), false)
+        }
+        let running = NSRunningApplication.runningApplications(withBundleIdentifier: job.app.bundleID).first { !$0.isTerminated }
+        if let running, await ElectronDetector.isReadyForBackground(pid: running.processIdentifier) {
+            return (try await AppCatalog.prepare(job.app), true)
+        }
+        if running != nil {
+            switch try await awaitChoice(for: job, prompt: .relaunch, status: "Needs a relaunch for background control") {
+            case .relaunch: break
+            default:
+                store.updateMessage(job.messageID, in: job.threadID) { $0.mode = .onScreen }
+                return (try await AppCatalog.prepare(job.app), false)
+            }
+        }
+        setStatus(running == nil ? "Opening \(job.app.name) for background control…" : "Relaunching \(job.app.name)…")
+        return (try await ElectronDetector.relaunchWithDebugging(bundleID: job.app.bundleID, name: job.app.name).app, true)
+    }
+
+    /// Shows a card on the task and waits for a choice. Stop cancels the task.
+    private func awaitChoice(for job: Job, prompt: WaitingPrompt, status: String, plan: [String]? = nil) async throws -> ScreenChoice {
+        defer { screenChoices[job.messageID] = nil }
+        store.updateMessage(job.messageID, in: job.threadID) { message in
+            message.state = .waiting
+            message.awaiting = prompt
+            message.status = status
+            message.plan = plan
+        }
+        while true {
+            try Task.checkCancellation()
+            if let choice = screenChoices[job.messageID] { return choice }
+            try await Task.sleep(nanoseconds: 200_000_000)
+        }
+    }
+
+    /// Background mode in apps without background control: borrow the screen once the user is idle.
+    private func awaitIdle(for job: Job, steps: [PlanStep]) async throws {
+        defer { screenChoices[job.messageID] = nil }
+        store.updateMessage(job.messageID, in: job.threadID) { message in
+            message.state = .waiting
+            message.awaiting = .screen
+            message.plan = steps.map(\.summary)
+        }
+        while true {
+            try Task.checkCancellation()
+            if screenChoices[job.messageID] != nil { return }
+            if Self.secondsSinceUserInput() >= Self.idleThreshold {
+                store.updateMessage(job.messageID, in: job.threadID) { $0.waitedForIdle = true }
+                return
+            }
+            updateWaiting(job, "Waiting until you're idle to use the screen…")
+            try await Task.sleep(nanoseconds: 250_000_000)
+        }
+    }
+
+    private func updateWaiting(_ job: Job, _ status: String) {
+        guard store.thread(job.threadID)?.messages.first(where: { $0.id == job.messageID })?.status != status else { return }
+        store.updateMessage(job.messageID, in: job.threadID) { $0.status = status }
+    }
+
+    nonisolated static func secondsSinceUserInput() -> TimeInterval {
+        CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: CGEventType(rawValue: ~0)!)
     }
 
     private func setStatus(_ status: String) {

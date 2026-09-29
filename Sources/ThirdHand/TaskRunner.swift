@@ -17,6 +17,10 @@ final class TaskRunner: ActionLayer {
     let credentials: CodexCredentials
     /// Earlier turns in the chat thread, for follow-ups.
     let context: [String]
+    /// Drive the app through its debugging connection without bringing it forward.
+    let background: Bool
+    /// Returns once the task may take over the screen for these steps; throws to stop.
+    var requestScreen: ([PlanStep]) async throws -> Void = { _ in }
     weak var delegate: TaskRunnerDelegate?
     private var task: Task<Void, Never>?
     private var history: [ActionHistory] = []
@@ -29,15 +33,21 @@ final class TaskRunner: ActionLayer {
     private var terminalInputPending = false
     /// Planning reads the app in the background; the app must stay in front once input starts.
     private var inForeground = false
+    /// Time spent waiting to use the screen doesn't count toward the task limit.
+    private var waitingForScreen = false
+    private var timedOut = false
+    nonisolated static let activeTimeLimit: TimeInterval = 300
     private var actions = 0
     private lazy var jev = JevClient(apiKey: apiKey)
 
-    init(target: AppTarget, goal: String, apiKey: String, credentials: CodexCredentials, context: [String] = []) {
+    init(target: AppTarget, goal: String, apiKey: String, credentials: CodexCredentials, context: [String] = [],
+         background: Bool = false) {
         self.target = target
         self.goal = goal
         self.apiKey = apiKey
         self.credentials = credentials
         self.context = context
+        self.background = background
     }
 
     func start() {
@@ -65,13 +75,32 @@ final class TaskRunner: ActionLayer {
 
     private func run() async {
         defer { active = false; cdpClient?.disconnect(); cdpClient = nil }
+        let watchdog = Task { [weak self] in
+            var elapsed: TimeInterval = 0
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                guard let self, self.active else { return }
+                if !self.waitingForScreen { elapsed += 1 }
+                if elapsed >= Self.activeTimeLimit {
+                    Log.info("Task active time limit reached phase=\(self.phase)")
+                    self.timedOut = true
+                    self.active = false
+                    self.cdpClient?.disconnect()
+                    self.task?.cancel()
+                    return
+                }
+            }
+        }
+        defer { watchdog.cancel() }
         do {
-            try await AsyncTimeout.run(seconds: 300, message: "Stopped after five minutes. The task has not been verified complete.", onTimeout: {
-                self.active = false
-                self.cdpClient?.disconnect()
-            }) { try await self.runAgent() }
+            try await runAgent()
         } catch is CancellationError {
+            if timedOut { delegate?.taskRunnerFailed(self, error: "Stopped after five minutes of work. The task has not been verified complete.") }
         } catch {
+            if timedOut {
+                delegate?.taskRunnerFailed(self, error: "Stopped after five minutes of work. The task has not been verified complete.")
+                return
+            }
             guard !Task.isCancelled else { return }
             let diagnostic = error as NSError
             Log.info("Task failed phase=\(phase) error_type=\(String(reflecting: type(of: error))) error_code=\(diagnostic.code)")
@@ -82,7 +111,32 @@ final class TaskRunner: ActionLayer {
     private func runAgent() async throws {
         guard AXIsProcessTrusted() else { throw ControllerError.invalid("Enable Accessibility for Third Hand in System Settings.") }
         try checkFocus()
-        if ElectronDetector.isElectron(target), let window = WindowSnapshot.frontWindow(pid: target.pid),
+        if background {
+            guard let port = await ElectronDetector.findDebugPort(pid: target.pid) else {
+                throw ControllerError.invalid("\(target.name) has no debugging connection, so it can't run in the background.")
+            }
+            // Right after a relaunch the page is still loading and the window may still be settling.
+            var lastError: Error?
+            for attempt in 1...20 {
+                try checkFocus()
+                if let window = WindowSnapshot.frontWindow(pid: target.pid) {
+                    let cdp = CDPClient(port: port)
+                    do {
+                        try await cdp.connect(windowFrame: window.frame, requireFocus: false)
+                        cdpClient = cdp
+                        Log.info("Background connection ready attempt=\(attempt)")
+                        break
+                    } catch {
+                        cdp.disconnect()
+                        lastError = error
+                    }
+                }
+                try await Task.sleep(nanoseconds: 500_000_000)
+            }
+            guard cdpClient != nil else {
+                throw ControllerError.invalid("Couldn't connect to \(target.name) in the background: \(lastError?.localizedDescription ?? "no window")")
+            }
+        } else if ElectronDetector.isElectron(target), let window = WindowSnapshot.frontWindow(pid: target.pid),
            let port = await ElectronDetector.findDebugPort(pid: target.pid) {
             try checkFocus()
             let cdp = CDPClient(port: port)
@@ -139,7 +193,7 @@ final class TaskRunner: ActionLayer {
         guard actions < maxSteps else {
             throw ControllerError.invalid("Stopped after \(maxSteps) actions. The final screen does not confirm completion.")
         }
-        try await bringToFront()
+        if !background { try await bringToFront() }
         var latest: [AccessibilityElement] = []
         // Separate observation budget bounds stale-window retries and recovery within a step.
         for _ in 0..<4 {
@@ -272,6 +326,16 @@ final class TaskRunner: ActionLayer {
         return StepOutcome(status: "blocked", detail: "The app kept changing before this step could be performed safely.", elements: latest)
     }
 
+    func prepare(for steps: [PlanStep]) async throws {
+        guard !inForeground, !background else { return }
+        phase = "awaiting_screen"
+        waitingForScreen = true
+        defer { waitingForScreen = false }
+        try await requestScreen(steps)
+        try checkFocus()
+        try await bringToFront()
+    }
+
     /// Brings the app forward before its first input, once planning is done.
     private func bringToFront() async throws {
         guard !inForeground else { return }
@@ -294,7 +358,8 @@ final class TaskRunner: ActionLayer {
     /// Adds on-device OCR once per task. Returns false when already used or not permitted.
     private func enableOCR(_ reason: String) -> Bool {
         phase = "recovery"
-        guard !useOCR, CGPreflightScreenCaptureAccess(), progress.beginRecovery() else {
+        // OCR regions can only be clicked with the real mouse, which background control doesn't use.
+        guard !useOCR, !background, CGPreflightScreenCaptureAccess(), progress.beginRecovery() else {
             Log.info("OCR recovery unavailable already_used=\(useOCR)")
             return false
         }
@@ -325,9 +390,14 @@ final class TaskRunner: ActionLayer {
         if let cdp = cdpClient {
             do { elements = try await cdp.extractElements() }
             catch is CancellationError { throw CancellationError() }
-            catch { cdp.disconnect(); cdpClient = nil; Log.info("Browser observation unavailable; using accessibility") }
+            catch {
+                cdp.disconnect(); cdpClient = nil
+                // Accessibility IDs don't address page elements, so background control can't fall back.
+                if background { throw ControllerError.invalid("Lost the background connection to \(target.name).") }
+                Log.info("Browser observation unavailable; using accessibility")
+            }
         }
-        if elements.isEmpty { elements = AXTreeWalker.walk(target: target) }
+        if elements.isEmpty && !background { elements = AXTreeWalker.walk(target: target) }
         try checkFocus()
         if useOCR {
             let ocr = try await AsyncTimeout.run(seconds: 8, message: "Local screen reading timed out.") {
@@ -371,7 +441,29 @@ final class TaskRunner: ActionLayer {
 
     // MARK: - Execution
 
+    /// Background input through the debugging connection; the app stays wherever it is.
+    private func executeInBackground(_ decision: AgentDecision) async throws {
+        guard let cdp = cdpClient else { throw ControllerError.invalid("The background connection closed.") }
+        let id = decision.targetIndex.flatMap(Int.init)
+        switch decision.operation {
+        case "CLICK", "CLICK_TEXT":
+            guard let id else { throw ControllerError.invalid("No control was selected.") }
+            try await cdp.click(id: id)
+        case "DOUBLE_CLICK":
+            guard let id else { throw ControllerError.invalid("No control was selected.") }
+            try await cdp.click(id: id, count: 2)
+        case "TYPE_TEXT":
+            guard let id, let text = decision.textValue else { throw ControllerError.invalid("No editable field was selected.") }
+            try await cdp.replaceText(id: id, text: text)
+        case "KEY_PRESS": try await cdp.press(decision.key!, modifiers: decision.modifiers ?? [])
+        case "SCROLL_UP", "SCROLL_DOWN": try await cdp.scroll(deltaY: decision.operation == "SCROLL_UP" ? -400 : 400, at: id)
+        case "WAIT": try await Task.sleep(nanoseconds: 700_000_000)
+        default: throw ControllerError.invalid("That action isn't available in the background.")
+        }
+    }
+
     private func execute(_ decision: AgentDecision, elements: [AccessibilityElement], windowFrame: CGRect?) async throws {
+        if background { return try await executeInBackground(decision) }
         let element = elements.first { String($0.id) == decision.targetIndex }
         let point: CGPoint?
         if let element, let frame = element.screenFrame() {

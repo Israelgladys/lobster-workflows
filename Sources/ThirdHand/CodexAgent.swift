@@ -36,6 +36,12 @@ extension CodexClient: Planner {}
 protocol ActionLayer: AnyObject {
     func currentElements() async throws -> [AccessibilityElement]
     func perform(step: PlanStep) async throws -> StepOutcome
+    /// Called with each plan before its steps run, e.g. to wait for permission to use the screen.
+    func prepare(for steps: [PlanStep]) async throws
+}
+
+extension ActionLayer {
+    func prepare(for steps: [PlanStep]) async throws {}
 }
 
 /// Codex plans the task and writes all text; the action layer resolves each step's label (Jev only when ambiguous) and executes it.
@@ -227,6 +233,7 @@ final class CodexAgent {
                 }
                 let finishes = args["finishes_task"] as? Bool ?? false
                 Log.info("Plan steps=\(steps.count) finishes=\(finishes)")
+                try await layer.prepare(for: steps)
                 var results: [[String: Any]] = []
                 var last: StepOutcome?
                 for (index, step) in steps.enumerated() {
