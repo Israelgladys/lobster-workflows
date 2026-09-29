@@ -15,38 +15,42 @@ struct AppTarget {
         ["com.apple.Terminal", "com.googlecode.iterm2", "com.mitchellh.ghostty", "dev.warp.Warp-Stable", "net.kovidgoyal.kitty", "org.alacritty"].contains(bundleIdentifier ?? "")
     }
 
+    static let ignoredBundles: Set<String> = [
+        Bundle.main.bundleIdentifier ?? "",
+        "com.apple.SecurityAgent",
+        "com.apple.loginwindow",
+        "com.apple.UserNotificationCenter",
+    ]
+
     static func captureCurrentApp() -> AppTarget? {
         guard let frontApp = NSWorkspace.shared.frontmostApplication else {
             Log.info("captureCurrentApp: no frontmost app")
             return nil
         }
-        let pid = frontApp.processIdentifier
-        Log.info("captureCurrentApp: \(frontApp.localizedName ?? "?") pid=\(pid) bundle=\(frontApp.bundleIdentifier ?? "nil")")
-        let ignoredBundles: Set<String> = [
-            Bundle.main.bundleIdentifier ?? "",
-            "com.apple.SecurityAgent",
-            "com.apple.loginwindow",
-            "com.apple.UserNotificationCenter",
-        ]
-        guard let bundleId = frontApp.bundleIdentifier,
-              !ignoredBundles.contains(bundleId) else {
-            Log.info("captureCurrentApp: filtered out (self or system: \(frontApp.bundleIdentifier ?? "nil"))")
+        Log.info("captureCurrentApp: \(frontApp.localizedName ?? "?") pid=\(frontApp.processIdentifier) bundle=\(frontApp.bundleIdentifier ?? "nil")")
+        return make(from: frontApp)
+    }
+
+    /// A target for any running app except Third Hand itself and system security UI.
+    static func make(from app: NSRunningApplication) -> AppTarget? {
+        guard let bundleId = app.bundleIdentifier, !ignoredBundles.contains(bundleId), !app.isTerminated else {
+            Log.info("AppTarget: filtered out (self or system: \(app.bundleIdentifier ?? "nil"))")
             return nil
         }
-
+        let pid = app.processIdentifier
         let appElement = AXUIElementCreateApplication(pid)
         let windowElement = focusedWindow(of: appElement)
         let frame = windowElement.flatMap { windowFrame(of: $0) }
 
         return AppTarget(
             pid: pid,
-            name: frontApp.localizedName ?? "Unknown",
+            name: app.localizedName ?? "Unknown",
             bundleIdentifier: bundleId,
-            application: frontApp,
+            application: app,
             appElement: appElement,
             windowElement: windowElement,
             windowFrame: frame,
-            icon: frontApp.icon
+            icon: app.icon
         )
     }
 

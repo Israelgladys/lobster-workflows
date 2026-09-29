@@ -4,7 +4,7 @@ import ApplicationServices
 @MainActor
 protocol TaskRunnerDelegate: AnyObject {
     func taskRunner(_ r: TaskRunner, status: String)
-    func taskRunnerDone(_ r: TaskRunner)
+    func taskRunnerDone(_ r: TaskRunner, summary: String)
     func taskRunnerFailed(_ r: TaskRunner, error: String)
     func taskRunnerCancelled(_ r: TaskRunner)
 }
@@ -15,6 +15,8 @@ final class TaskRunner: ActionLayer {
     let goal: String
     let apiKey: String
     let credentials: CodexCredentials
+    /// Earlier turns in the chat thread, for follow-ups.
+    let context: [String]
     weak var delegate: TaskRunnerDelegate?
     private var task: Task<Void, Never>?
     private var history: [ActionHistory] = []
@@ -28,11 +30,12 @@ final class TaskRunner: ActionLayer {
     private var actions = 0
     private lazy var jev = JevClient(apiKey: apiKey)
 
-    init(target: AppTarget, goal: String, apiKey: String, credentials: CodexCredentials) {
+    init(target: AppTarget, goal: String, apiKey: String, credentials: CodexCredentials, context: [String] = []) {
         self.target = target
         self.goal = goal
         self.apiKey = apiKey
         self.credentials = credentials
+        self.context = context
     }
 
     func start() {
@@ -96,7 +99,7 @@ final class TaskRunner: ActionLayer {
         Log.info("Planner tier model=\(tier.model) effort=\(tier.effort)")
         let agent = CodexAgent(planner: CodexClient(credentials: credentials), tier: tier,
                                escalation: override.0 == nil && override.1 == nil ? .strong : nil)
-        let outcome = try await agent.run(goal: goal, appName: target.name, layer: self) { [weak self] status in
+        let outcome = try await agent.run(goal: goal, appName: target.name, context: context, layer: self) { [weak self] status in
             guard let self else { return }
             self.delegate?.taskRunner(self, status: status)
         }
@@ -104,7 +107,7 @@ final class TaskRunner: ActionLayer {
         switch outcome {
         case .done(let summary):
             Log.info("Task completed actions=\(actions) summary_chars=\(summary.count)")
-            delegate?.taskRunnerDone(self)
+            delegate?.taskRunnerDone(self, summary: summary)
         case .failed(let reason):
             Log.info("Task stopped by planner actions=\(actions)")
             delegate?.taskRunnerFailed(self, error: reason)

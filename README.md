@@ -2,9 +2,12 @@
 
 > Third Hand was a proof of concept to show that we can use Jev for computer use, but now we are building a full-fledged assistant.
 
-A small macOS menu bar assistant. Focus an app, press **Control–Space**, and tell it what to do.
+A macOS assistant you chat with. Tag an app with **@** in a thread, like `@Spotify play something chill`, and Third Hand does it: it reads the app's accessible controls, clicks and types, and checks the result.
 
-Third Hand reads accessible controls, types, clicks, and checks the result. Press **Control–Space** again or click **×** to stop.
+- **Threads** work like channels: each keeps its own history, so follow-ups ("now play the second one") work. A message without an @ uses the thread's last app.
+- **@mentions** list running and installed apps; tagging one that isn't open launches it.
+- **Control–Space** in any app opens a new thread with that app already tagged.
+- Click **Stop** on a running task to cancel it. Tasks run one at a time and take over the screen while they work.
 
 ## Download
 
@@ -28,7 +31,7 @@ In the setup window:
 3. Add your **TypeSafe API key**. It’s saved in macOS Keychain.
 4. Click **Sign in with ChatGPT** and finish signing in in your browser. Tokens are saved in macOS Keychain.
 
-Switch to an app, press **Control–Space**, and try a specific task, such as “Search for Adele.”
+Open Third Hand from the Dock, start a thread, and try a specific task, such as “@Spotify search for Adele.”
 
 The app runs on macOS 14+. Apple Intelligence is not required.
 

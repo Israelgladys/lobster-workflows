@@ -5,18 +5,22 @@ struct ThirdHandApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
 
     var body: some Scene {
-        MenuBarExtra("Third Hand", systemImage: "hand.raised") {
-            Button("Run on Current App (⌃Space)") {
-                appDelegate.handleHotkey()
+        // The chat window is managed by AppDelegate so the Dock icon and Control–Space can always reopen it.
+        Settings {
+            SetupView(delegate: appDelegate)
+        }
+        .commands {
+            CommandGroup(replacing: .newItem) {
+                Button("New Thread") {
+                    appDelegate.chat.newThread()
+                    appDelegate.showMain()
+                }
+                .keyboardShortcut("n")
             }
-            Button("Status & Permissions…") { appDelegate.showSetup() }
-            Divider()
-            Button("Set API Key…") {
-                appDelegate.promptAPIKey()
+            CommandGroup(after: .windowList) {
+                Button("Third Hand") { appDelegate.showMain() }
+                    .keyboardShortcut("0")
             }
-            Text("Shortcut: ⌃ Space")
-            Divider()
-            Button("Quit") { NSApp.terminate(nil) }
         }
     }
 }

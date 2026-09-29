@@ -3,17 +3,15 @@ import ApplicationServices
 import SwiftUI
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate, TaskRunnerDelegate, ObservableObject {
+final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     private var hotkeyManager: HotkeyManager?
-    private var overlayPanel: OverlayPanel?
-    private var taskRunner: TaskRunner?
-    private var statusWindow: StatusIndicatorWindow?
-    private var currentTarget: AppTarget?
     private var didStart = false
+    private var mainWindow: NSWindow?
     private var setupWindow: NSWindow?
     private var permissionTimer: Timer?
     private var apiKey: String?
     private var codexCredentials: CodexCredentials?
+    let chat = ChatController()
     @Published var accessibilityReady = false
     @Published var shortcutReady = false
     @Published var screenReady = false
@@ -21,6 +19,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, TaskRunnerDelegate, Ob
     @Published var codexAccount: String?
     @Published var codexSigningIn = false
     var codexReady: Bool { codexAccount != nil }
+    var isReady: Bool { accessibilityReady && keyReady && codexReady }
 
     func applicationWillFinishLaunching(_ notification: Notification) {
         Log.info("applicationWillFinishLaunching")
@@ -34,7 +33,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, TaskRunnerDelegate, Ob
         hotkeyManager = HotkeyManager { [weak self] in
             self?.handleHotkey()
         }
-        showSetup()
+        chat.credentials = { [weak self] in
+            guard let self, AXIsProcessTrusted(), let apiKey = self.apiKey, let codex = self.codexCredentials else { return nil }
+            return (apiKey, codex)
+        }
+        chat.onTaskFinished = { [weak self] in self?.showMain() }
+        chat.onSetupNeeded = { [weak self] in self?.showSetup() }
+        chat.catalog.refresh()
+        showMain()
         refreshPermissions()
         permissionTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.refreshPermissions() }
@@ -45,21 +51,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate, TaskRunnerDelegate, Ob
             self.apiKey = KeychainHelper.getAPIKey()
             self.keyReady = self.apiKey != nil
             if let tokens = KeychainHelper.getCodexTokens() { self.useCodex(tokens) }
+            if !self.isReady { self.showSetup() }
         }
 
         Log.info("setup done")
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        showSetup()
+        showMain()
         return true
+    }
+
+    func showMain() {
+        if mainWindow == nil {
+            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 960, height: 640),
+                                  styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
+                                  backing: .buffered, defer: false)
+            window.title = "Third Hand"
+            window.titleVisibility = .hidden
+            window.titlebarAppearsTransparent = true
+            window.appearance = NSAppearance(named: .darkAqua)
+            window.backgroundColor = .black
+            window.isReleasedWhenClosed = false
+            window.contentView = NSHostingView(rootView: MainView(chat: chat, store: chat.store, setup: self))
+            window.setFrameAutosaveName("ThirdHandMain")
+            if !window.setFrameUsingName("ThirdHandMain") { window.center() }
+            mainWindow = window
+        }
+        mainWindow?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
     }
 
     func showSetup() {
         if setupWindow == nil {
             let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 540, height: 520),
                                   styleMask: [.titled, .closable], backing: .buffered, defer: false)
-            window.title = "Third Hand"
+            window.title = "Third Hand Setup"
+            window.appearance = NSAppearance(named: .darkAqua)
+            window.backgroundColor = .black
             window.isReleasedWhenClosed = false
             window.contentView = NSHostingView(rootView: SetupView(delegate: self))
             window.center()
@@ -89,89 +118,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, TaskRunnerDelegate, Ob
 
     // MARK: - Hotkey
 
+    /// Opens a new thread with the app that was in front already mentioned.
     @objc func handleHotkey() {
         Log.info("Hotkey fired")
-        guard AXIsProcessTrusted() else { showSetup(); return }
-        if overlayPanel != nil { dismissOverlay(); return }
-        if taskRunner != nil { taskRunner?.cancel(); statusWindow?.dismiss(); taskRunner = nil; return }
-
-        guard apiKey != nil else { Log.info("No API key"); promptAPIKey(); return }
-        guard codexCredentials != nil else { Log.info("No ChatGPT sign-in"); showSetup(); return }
-        guard let target = AppTarget.captureCurrentApp() else { Log.info("No target app"); return }
-
-        currentTarget = target
-        showOverlay(for: target)
-    }
-
-    // MARK: - Overlay
-
-    private func showOverlay(for target: AppTarget, prompt: String = "What should I do?") {
-        dismissOverlay()
-        overlayPanel = OverlayPanel(
-            target: target,
-            prompt: prompt,
-            onSubmit: { [weak self] task in
-                self?.dismissOverlay()
-                self?.startTask(task)
-            },
-            onCancel: { [weak self] in
-                self?.dismissOverlay()
-                self?.reactivateTarget()
-            }
-        )
-        overlayPanel?.show()
-    }
-
-    private func dismissOverlay() {
-        overlayPanel?.close()
-        overlayPanel = nil
-    }
-
-    private func reactivateTarget() {
-        currentTarget?.application.activate()
-    }
-
-    // MARK: - Task execution
-
-    private func startTask(_ task: String) {
-        guard let target = currentTarget, let apiKey, let codexCredentials else { return }
-
-        let runner = TaskRunner(target: target, goal: task, apiKey: apiKey, credentials: codexCredentials)
-        runner.delegate = self
-        taskRunner = runner
-
-        statusWindow?.dismiss()
-        statusWindow = StatusIndicatorWindow(near: target) { [weak self] in
-            self?.taskRunner?.cancel()
+        let front = NSWorkspace.shared.frontmostApplication
+        let app = front.flatMap { app -> ChatApp? in
+            guard let id = app.bundleIdentifier, !AppTarget.ignoredBundles.contains(id) else { return nil }
+            return ChatApp(name: app.localizedName ?? id, bundleID: id)
         }
-
-        runner.start()
-    }
-
-    // MARK: - TaskRunnerDelegate
-
-    func taskRunner(_ r: TaskRunner, status: String) {
-        guard taskRunner === r else { return }
-        statusWindow?.updateStatus(status)
-    }
-
-    func taskRunnerDone(_ r: TaskRunner) {
-        guard taskRunner === r else { return }
-        statusWindow?.showDone()
-        taskRunner = nil
-    }
-
-    func taskRunnerFailed(_ r: TaskRunner, error: String) {
-        guard taskRunner === r else { return }
-        Log.info("Task stopped; blocker displayed in status panel")
-        statusWindow?.showError(error)
-        taskRunner = nil
-    }
-
-    func taskRunnerCancelled(_ r: TaskRunner) {
-        guard taskRunner === r else { return }
-        statusWindow?.dismiss()
-        taskRunner = nil
+        Log.info("Hotkey thread app=\(app?.bundleID ?? "none")")
+        chat.newThread(app: app)
+        showMain()
     }
 
     // MARK: - Onboarding
@@ -203,7 +160,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, TaskRunnerDelegate, Ob
                 try KeychainHelper.saveCodexTokens(tokens)
                 useCodex(tokens)
                 Log.info("ChatGPT sign-in succeeded")
-                showSetup()
+                if isReady { setupWindow?.close(); showMain() } else { showSetup() }
             } catch is CancellationError {
             } catch {
                 Log.info("ChatGPT sign-in failed")
@@ -255,7 +212,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, TaskRunnerDelegate, Ob
     }
 }
 
-private struct SetupView: View {
+struct SetupView: View {
     @ObservedObject var delegate: AppDelegate
 
     var body: some View {
@@ -268,7 +225,7 @@ private struct SetupView: View {
                         .foregroundStyle(.secondary)
                 }
             }
-            Text("Switch to Spotify, Blender, or another app, then press Control–Space. You can close this window; Third Hand stays in the menu bar.")
+            Text("Tag an app with @ in a thread, or press Control–Space in any app to start a thread with it.")
             HStack {
                 Text(delegate.accessibilityReady ? "✓ Accessibility enabled" : "Accessibility access needed")
                 Spacer()

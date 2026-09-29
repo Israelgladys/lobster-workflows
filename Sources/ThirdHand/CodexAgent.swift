@@ -176,9 +176,11 @@ final class CodexAgent {
         return .success(steps)
     }
 
-    func run(goal: String, appName: String, layer: ActionLayer,
+    func run(goal: String, appName: String, context: [String] = [], layer: ActionLayer,
              status: (String) -> Void = { _ in }) async throws -> AgentOutcome {
-        let opening = "Task: \(goal)\nApp: \(appName)"
+        let earlier = context.isEmpty ? "" : "Earlier in this chat (for follow-ups; the screen shows the current state):\n"
+            + context.map { "- " + $0 }.joined(separator: "\n") + "\n\n"
+        let opening = earlier + "Task: \(goal)\nApp: \(appName)"
         var input: [[String: Any]] = [Self.userMessage(opening + "\n\nCurrent screen:\n" + Self.describe(try await layer.currentElements()))]
         // Only the newest screen is sent in full; older ones are replaced to bound the context.
         // The opening message is always input[0]; step screens are found by call ID.
