@@ -241,7 +241,7 @@ private func call(_ id: String, _ name: String, _ args: [String: Any?]) -> [Stri
 private func act(_ id: String, _ steps: [(String, String?)], summary: String?) -> [String: Any] {
     // ("Press Return", nil) is a press step, (label, text) a type step, and (label, nil) a click step.
     func step(_ label: String, _ text: String?) -> [String: Any] {
-        var step: [String: Any] = ["action": "click", "target": label, "role": NSNull(), "text": NSNull(), "key": NSNull(), "direction": NSNull()]
+        var step: [String: Any] = ["action": "click", "target": label, "role": NSNull(), "near": NSNull(), "text": NSNull(), "key": NSNull(), "direction": NSNull()]
         if label.hasPrefix("Press ") {
             step["action"] = "press"; step["target"] = NSNull(); step["key"] = String(label.dropFirst(6)).lowercased()
         } else if let text {
@@ -436,7 +436,7 @@ final class PlanValidationTests: XCTestCase {
         let act = CodexAgent.tools.first { $0["name"] as? String == "act" }!
         let steps = (act["parameters"] as! [String: Any])["properties"] as! [String: Any]
         let item = (steps["steps"] as! [String: Any])["items"] as! [String: Any]
-        XCTAssertEqual(item["required"] as? [String], ["action", "target", "role", "text", "key", "direction"])
+        XCTAssertEqual(item["required"] as? [String], ["action", "target", "role", "near", "text", "key", "direction"])
         let action = (item["properties"] as! [String: Any])["action"] as! [String: Any]
         XCTAssertEqual(action["enum"] as? [String], ["click", "type", "press", "scroll", "wait"])
     }

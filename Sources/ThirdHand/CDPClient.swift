@@ -95,9 +95,35 @@ final class CDPClient {
                               y: originY + max(0, snapshot.screen.height - snapshot.viewportHeight) + el.rect.y,
                               width: el.rect.w,
                               height: el.rect.h),
-                focused: el.focused
+                focused: el.focused,
+                source: "dom",
+                context: el.context,
+                selector: el.selector
             )
         }
+    }
+
+    /// Resolves once the page stops changing: after the first DOM change within `firstChangeMs`,
+    /// it waits for `quietMs` without changes, up to `maxMs`. Returns false if nothing changed.
+    func waitForQuiet(firstChangeMs: Int = 800, quietMs: Int = 150, maxMs: Int = 2000) async throws -> Bool {
+        let result = try await send(method: "Runtime.evaluate", params: [
+            "expression": """
+            new Promise(resolve => {
+                let changed = false, quietTimer = null;
+                const done = value => { observer.disconnect(); clearTimeout(firstTimer); clearTimeout(maxTimer); clearTimeout(quietTimer); resolve(value); };
+                const observer = new MutationObserver(() => {
+                    changed = true;
+                    clearTimeout(quietTimer);
+                    quietTimer = setTimeout(() => done(true), \(quietMs));
+                });
+                observer.observe(document, {subtree: true, childList: true, attributes: true, characterData: true});
+                const firstTimer = setTimeout(() => { if (!changed) done(false); }, \(firstChangeMs));
+                const maxTimer = setTimeout(() => done(changed), \(maxMs));
+            })
+            """,
+            "awaitPromise": true, "returnByValue": true
+        ])
+        return (result["result"] as? [String: Any])?["value"] as? Bool ?? false
     }
 
     // MARK: - Background input
@@ -216,6 +242,8 @@ final class CDPClient {
             let focused: Bool
             let actions: [String]
             let rect: Rect
+            let context: String?
+            let selector: String?
         }
         struct Rect: Decodable {
             let x: Double, y: Double, w: Double, h: Double
@@ -273,6 +301,28 @@ final class CDPClient {
                 || null;
         }
 
+        // The nearest row-like ancestor's text distinguishes repeated controls such as "Play".
+        const contextCache = new Map();
+        function contextOf(el, own) {
+            let p = el.parentElement;
+            for (let depth = 0; p && depth < 6; depth++, p = p.parentElement) {
+                const r = p.getAttribute('role');
+                if (!(r === 'row' || r === 'listitem' || r === 'option' || r === 'gridcell' || r === 'article'
+                      || p.tagName === 'LI' || p.tagName === 'ARTICLE' || p.hasAttribute('data-testid'))) continue;
+                if (!contextCache.has(p)) {
+                    contextCache.set(p, (p.getAttribute('aria-label') || p.innerText || '').replace(/\s+/g, ' ').trim().substring(0, 100));
+                }
+                const text = contextCache.get(p);
+                if (text && text !== own) return text;
+            }
+            return null;
+        }
+
+        function selectorOf(el) {
+            const id = el.getAttribute('data-testid');
+            return id ? '[data-testid="' + CSS.escape(id) + '"]' : null;
+        }
+
         function visible(el) {
             const r = el.getBoundingClientRect();
             if (r.width <= 0 || r.height <= 0 || r.right <= 0 || r.bottom <= 0 || r.left >= innerWidth || r.top >= innerHeight) return false;
@@ -316,7 +366,8 @@ final class CDPClient {
                             && node.getAttribute('aria-disabled') !== 'true',
                         focused: node === document.activeElement,
                         actions: ['AXPress'],
-                        rect: {x:r.x, y:r.y, w:r.width, h:r.height}
+                        rect: {x:r.x, y:r.y, w:r.width, h:r.height},
+                        context: contextOf(node, l), selector: selectorOf(node)
                     });
                     // Keep descending: parent controls may contain editable children.
                 }
@@ -332,7 +383,8 @@ final class CDPClient {
                             id: nextId++, role: 'AXStaticText',
                             label: text.substring(0, 120), value: null,
                             enabled: true, focused: false, actions: [],
-                            rect: {x:r.x, y:r.y, w:r.width, h:r.height}
+                            rect: {x:r.x, y:r.y, w:r.width, h:r.height},
+                            context: null, selector: null
                         });
                     }
                 }

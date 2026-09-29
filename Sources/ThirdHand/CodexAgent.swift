@@ -77,6 +77,8 @@ final class CodexAgent {
     - press: `key` such as return, escape, tab, space, down, or a shortcut like command+f.
     - scroll: `direction` up or down; `target` optionally names the list or area to scroll.
     - wait: let content load.
+    - near: when several controls share a label (e.g. many "Play" buttons), set `near` to text from the \
+    target's "in …" context in the screen list, such as the song title; otherwise null.
     Set every field a step doesn't use to null. Only use labels that appear in the screen list; to reach a control \
     that isn't listed yet, end the plan after the step that reveals it and set `finishes_task` to false. \
     You write all text yourself: search keywords, messages, commands, and form values. \
@@ -106,11 +108,12 @@ final class CodexAgent {
                             "summary": ["type": "string", "description": "One sentence: the result if finishes_task, otherwise what you'll check next."],
                             "steps": ["type": "array", "minItems": 1, "maxItems": maxStepsPerPlan,
                                       "items": ["type": "object", "additionalProperties": false,
-                                                "required": ["action", "target", "role", "text", "key", "direction"],
+                                                "required": ["action", "target", "role", "near", "text", "key", "direction"],
                                                 "properties": [
                                                     "action": ["type": "string", "enum": PlanStep.actions],
                                                     "target": ["type": ["string", "null"], "description": "Exact on-screen label for click and type; optional area for scroll."],
                                                     "role": ["type": ["string", "null"], "description": "The target's role as shown in the screen list."],
+                                                    "near": ["type": ["string", "null"], "description": "Text from the target's context that tells identical controls apart."],
                                                     "text": ["type": ["string", "null"], "description": "Exact text for type steps."],
                                                     "key": ["type": ["string", "null"], "description": "Key or shortcut for press steps, e.g. return or command+f."],
                                                     "direction": ["type": ["string", "null"], "enum": ["up", "down", NSNull()], "description": "Scroll direction."]
@@ -146,6 +149,7 @@ final class CodexAgent {
             if element.focused { line += " [focused]" }
             if !element.enabled { line += " [disabled]" }
             if element.source == "ocr" { line += " (ocr text)" }
+            if let context = element.context { line += " in \"\(context.prefix(80))\"" }
             guard seen.insert(line).inserted else { continue }
             guard used + line.count <= maxScreenCharacters else { omitted += elements.count - lines.count; break }
             used += line.count + 1
@@ -237,8 +241,9 @@ final class CodexAgent {
                 var results: [[String: Any]] = []
                 var last: StepOutcome?
                 for (index, step) in steps.enumerated() {
+                    let stepStart = Date()
                     let outcome = try await layer.perform(step: step)
-                    Log.info("Step \(index + 1)/\(steps.count) action=\(step.action) status=\(outcome.status)")
+                    Log.info("Step \(index + 1)/\(steps.count) action=\(step.action) status=\(outcome.status) ms=\(Int(Date().timeIntervalSince(stepStart) * 1000))")
                     results.append(["step": index + 1, "action": step.summary, "status": outcome.status, "detail": outcome.detail])
                     last = outcome
                     if !outcome.succeeded { break }

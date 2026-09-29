@@ -76,11 +76,13 @@ final class JevClient {
             .map(\.element)
     }
 
-    nonisolated static func groundRequest(action: String, target: String, role: String?, candidates: [AccessibilityElement],
+    nonisolated static func groundRequest(action: String, target: String, role: String?, near: String? = nil,
+                                          candidates: [AccessibilityElement],
                                           appName: String) throws -> (data: Data, offered: [String: AccessibilityElement]) {
-        var selected = shortlist(candidates, target: target, role: role)
+        var selected = shortlist(candidates, target: (near.map { target + " " + $0 }) ?? target, role: role)
         let verb = action == "type" ? "type into" : "click"
-        let described = role.map { "the \($0) labelled \"\(target)\"" } ?? "the control labelled \"\(target)\""
+        let described = (role.map { "the \($0) labelled \"\(target)\"" } ?? "the control labelled \"\(target)\"")
+            + (near.map { " near \"\($0)\"" } ?? "")
         while true {
             var criteria: [String: String] = [:]
             for element in selected {
@@ -88,12 +90,13 @@ final class JevClient {
                 if let value = element.value, !value.isEmpty, value != element.label { desc += " = \(value.prefix(160))" }
                 desc += " [\(element.displayRole)]"
                 if element.source == "ocr" { desc += " (ocr text)" }
+                if let context = element.context { desc += " — in \"\(context.prefix(100))\"" }
                 criteria[String(element.id)] = desc
             }
             criteria[noneKey] = "None of these is \(described)"
             let body: [String: Any] = [
                 "model": "jev-latest",
-                "state": ["app": String(appName.prefix(100)), "action": action, "target": target, "role": role ?? ""],
+                "state": ["app": String(appName.prefix(100)), "action": action, "target": target, "role": role ?? "", "near": near ?? ""],
                 "questions": ["target": [
                     "type": "choice", "criteria": criteria,
                     "instructions": "The planner wants to \(verb) \(described). Which element is it? Labels may differ slightly in wording, case, or truncation. OCR text is only valid when it names that control. Choose none if no element plausibly is it."
@@ -121,9 +124,10 @@ final class JevClient {
     }
 
     /// The element a step's label refers to among action-compatible candidates, or nil when none matches.
-    func ground(action: String, target: String, role: String?, candidates: [AccessibilityElement],
+    func ground(action: String, target: String, role: String?, near: String? = nil, candidates: [AccessibilityElement],
                 appName: String) async throws -> AccessibilityElement? {
-        let prepared = try Self.groundRequest(action: action, target: target, role: role, candidates: candidates, appName: appName)
+        let prepared = try Self.groundRequest(action: action, target: target, role: role, near: near,
+                                              candidates: candidates, appName: appName)
         var request = URLRequest(url: endpoint, timeoutInterval: 15)
         request.httpMethod = "POST"
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")

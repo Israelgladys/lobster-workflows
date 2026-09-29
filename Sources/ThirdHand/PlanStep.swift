@@ -7,6 +7,8 @@ struct PlanStep: Equatable {
     let action: String
     var target: String? = nil
     var role: String? = nil
+    /// Text near the target (e.g. its row) that tells identical controls apart.
+    var near: String? = nil
     var text: String? = nil
     var key: String? = nil
     var modifiers: [String] = []
@@ -30,7 +32,7 @@ struct PlanStep: Equatable {
         guard let action = string("action"), actions.contains(action) else {
             return .failure(.invalid("Each step needs an action: \(actions.joined(separator: ", "))."))
         }
-        var step = PlanStep(action: action, target: string("target"), role: string("role"))
+        var step = PlanStep(action: action, target: string("target"), role: string("role"), near: string("near"))
         if let target = step.target, target.utf8.count > 300 {
             return .failure(.invalid("Targets must be a short on-screen label."))
         }
@@ -66,7 +68,7 @@ struct PlanStep: Equatable {
         case "press": return "press \((modifiers + [key ?? ""]).joined(separator: "+"))"
         case "scroll": return "scroll \(direction ?? "")" + (target.map { " in \"\($0)\"" } ?? "")
         case "wait": return "wait"
-        default: return "\(action) \"\(target ?? "")\"" + (role.map { " (\($0))" } ?? "")
+        default: return "\(action) \"\(target ?? "")\"" + (role.map { " (\($0))" } ?? "") + (near.map { " near \"\($0)\"" } ?? "")
         }
     }
 }
@@ -76,15 +78,21 @@ enum StepMatcher {
         text.lowercased().split(whereSeparator: \.isWhitespace).joined(separator: " ")
     }
 
-    /// Elements whose on-screen label is exactly the target. The role narrows matches but a wrong role
-    /// never hides the only label match.
-    nonisolated static func exact(target: String, role: String?, in pool: [AccessibilityElement]) -> [AccessibilityElement] {
+    /// Elements whose on-screen label is exactly the target. The role and nearby text narrow matches,
+    /// but never hide the only label match.
+    nonisolated static func exact(target: String, role: String?, near: String? = nil, in pool: [AccessibilityElement]) -> [AccessibilityElement] {
         let wanted = normalize(target)
-        let labelled = pool.filter { element in
+        var matches = pool.filter { element in
             normalize(element.displayLabel) == wanted || element.label.map { normalize($0) == wanted } == true
         }
-        guard let role, labelled.count > 1 else { return labelled }
-        let roled = labelled.filter { normalize($0.displayRole) == normalize(role) }
-        return roled.isEmpty ? labelled : roled
+        if let role, matches.count > 1 {
+            let roled = matches.filter { normalize($0.displayRole) == normalize(role) }
+            if !roled.isEmpty { matches = roled }
+        }
+        if let near, matches.count > 1 {
+            let nearby = matches.filter { $0.context.map { normalize($0).contains(normalize(near)) } == true }
+            if !nearby.isEmpty { matches = nearby }
+        }
+        return matches
     }
 }

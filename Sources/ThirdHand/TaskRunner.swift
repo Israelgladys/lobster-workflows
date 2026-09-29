@@ -213,12 +213,12 @@ final class TaskRunner: ActionLayer {
             case "wait":
                 decision = AgentDecision(operation: "WAIT")
             case "scroll":
-                let anchor = step.target.flatMap { StepMatcher.exact(target: $0, role: step.role, in: observation.elements).first }
+                let anchor = step.target.flatMap { StepMatcher.exact(target: $0, role: step.role, near: step.near, in: observation.elements).first }
                 decision = AgentDecision(operation: step.direction == "up" ? "SCROLL_UP" : "SCROLL_DOWN", targetIndex: anchor.map { String($0.id) })
             default:
                 let label = step.target ?? ""
                 let candidates = pool(for: step.action, in: observation.elements)
-                let matches = StepMatcher.exact(target: label, role: step.role, in: candidates)
+                let matches = StepMatcher.exact(target: label, role: step.role, near: step.near, in: candidates)
                 var chosen: AccessibilityElement?
                 if matches.count == 1 {
                     chosen = matches[0]
@@ -226,7 +226,7 @@ final class TaskRunner: ActionLayer {
                 } else if !candidates.isEmpty {
                     phase = "grounding"
                     do {
-                        chosen = try await jev.ground(action: step.action, target: label, role: step.role,
+                        chosen = try await jev.ground(action: step.action, target: label, role: step.role, near: step.near,
                                                       candidates: matches.count > 1 ? matches : candidates, appName: target.name)
                     } catch is CancellationError { throw CancellationError() }
                     catch let error as JevServiceError { throw error }
@@ -415,6 +415,16 @@ final class TaskRunner: ActionLayer {
     }
 
     private func settle(after decision: AgentDecision, before: Observation) async throws -> Observation {
+        // A page can say when it stops changing, instead of polling the screen for a second or more.
+        if let cdp = cdpClient, background || cdp.isConnected {
+            do {
+                let changed = try await cdp.waitForQuiet()
+                let latest = try await observe()
+                Log.info("Settle via=dom changed=\(changed)")
+                return latest
+            } catch is CancellationError { throw CancellationError() }
+            catch { if background { throw error } }
+        }
         let clock = ContinuousClock()
         let start = clock.now
         let deadline = start.advanced(by: .seconds(2.5))

@@ -143,6 +143,32 @@ final class PlanStepTests: XCTestCase {
         XCTAssertTrue(StepMatcher.exact(target: "Pla", role: nil, in: pool).isEmpty, "Near misses go to Jev")
     }
 
+    func testNearTextSeparatesIdenticalControls() {
+        func play(_ id: Int, _ row: String?) -> AccessibilityElement {
+            var element = control(id, "AXButton", "Play")
+            element.context = row
+            return element
+        }
+        let pool = [play(1, "Hello · Adele"), play(2, "Skyfall · Adele"), play(3, nil)]
+        XCTAssertEqual(StepMatcher.exact(target: "Play", role: "button", near: "skyfall", in: pool).map(\.id), [2])
+        XCTAssertEqual(StepMatcher.exact(target: "Play", role: nil, near: "Rolling in the Deep", in: pool).map(\.id), [1, 2, 3],
+                       "Unmatched nearby text never hides label matches")
+        let prepared = try! JevClient.groundRequest(action: "click", target: "Play", role: "button", near: "Skyfall",
+                                                    candidates: Array(pool.prefix(2)), appName: "Spotify")
+        let criteria = (try! JSONSerialization.jsonObject(with: prepared.data) as! [String: Any])["questions"] as! [String: [String: Any]]
+        let options = criteria["target"]!["criteria"] as! [String: String]
+        XCTAssertTrue(options["2"]!.contains("Skyfall · Adele"), "Jev sees each duplicate's context")
+        XCTAssertTrue((criteria["target"]!["instructions"] as! String).contains("near \"Skyfall\""))
+    }
+
+    func testPlannerScreenShowsContextForDuplicates() {
+        var a = control(1, "AXButton", "Play"); a.context = "Hello · Adele"
+        var b = control(2, "AXButton", "Play"); b.context = "Skyfall · Adele"
+        let screen = CodexAgent.describe([a, b])
+        XCTAssertTrue(screen.contains("button \"Play\" in \"Skyfall · Adele\""))
+        XCTAssertEqual(screen.components(separatedBy: "\n").count, 2, "Context keeps duplicates distinct")
+    }
+
     func testFieldMatchesByLabelEvenWhenItShowsAValue() {
         let field = control(1, "AXTextField", "Search", value: "Frank Ocean")
         XCTAssertEqual(StepMatcher.exact(target: "Search", role: "textField", in: [field]).map(\.id), [1])

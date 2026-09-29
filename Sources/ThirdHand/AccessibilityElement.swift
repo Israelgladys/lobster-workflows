@@ -11,6 +11,10 @@ struct AccessibilityElement {
     var frame: CGRect? = nil
     var focused: Bool = false
     var source: String = "accessibility"
+    /// Text around the element (its row or list item) that tells identical controls apart.
+    var context: String? = nil
+    /// A stable page selector (e.g. data-testid) when read through a debugging connection.
+    var selector: String? = nil
 
     /// Preserve outcome evidence alongside actionable controls when trimming a screen.
     var isOutcomeEvidence: Bool {
