@@ -6,6 +6,7 @@ enum AXTreeWalker {
         var elements: [AccessibilityElement] = []
         var nextId = 1
         var visited = 0
+        var rows = RowTexts()
         let deadline = Date().addingTimeInterval(timeBudget)
         AXUIElementSetMessagingTimeout(target.appElement, 0.1)
         var focused: CFTypeRef?
@@ -15,16 +16,24 @@ enum AXTreeWalker {
             root = focused as! AXUIElement
         } else { root = target.appElement }
 
-        enumerate(root, depth: 0, maxDepth: 30, elements: &elements, nextId: &nextId, visited: &visited, deadline: deadline, limit: 1200)
+        enumerate(root, depth: 0, maxDepth: 30, row: nil, rows: &rows, elements: &elements, nextId: &nextId, visited: &visited, deadline: deadline, limit: 1200)
 
         if elements.isEmpty {
             var winVal: AnyObject?
             AXUIElementCopyAttributeValue(target.appElement, kAXWindowsAttribute as CFString, &winVal)
             if let windows = winVal as? [AXUIElement] {
                 for win in windows {
-                    enumerate(win, depth: 0, maxDepth: 30, elements: &elements, nextId: &nextId, visited: &visited, deadline: deadline, limit: 1200)
+                    enumerate(win, depth: 0, maxDepth: 30, row: nil, rows: &rows, elements: &elements, nextId: &nextId, visited: &visited, deadline: deadline, limit: 1200)
                 }
             }
+        }
+
+        // The text of an element's row or cell tells repeated controls apart, like DOM row context.
+        for index in elements.indices {
+            guard let row = rows.rowOf[elements[index].id], let text = rows.text[row] else { continue }
+            let own = elements[index].displayLabel
+            let context = text.filter { $0 != own }.joined(separator: " · ")
+            if !context.isEmpty { elements[index].context = String(context.prefix(100)) }
         }
 
         // Prioritize actual controls over static labels when the model's window is full.
@@ -47,6 +56,14 @@ enum AXTreeWalker {
         return elements
     }
 
+    struct RowTexts {
+        var next = 0
+        var text: [Int: [String]] = [:]
+        var rowOf: [Int: Int] = [:]
+    }
+
+    private static let rowRoles: Set<String> = ["AXRow", "AXCell", "AXOutlineRow", "AXTableRow"]
+
     private static let skipRoles: Set<String> = [
         "AXScrollArea", "AXSplitGroup", "AXLayoutArea",
         "AXScrollBar", "AXWindow", "AXSheet", "AXDrawer",
@@ -56,6 +73,8 @@ enum AXTreeWalker {
         _ element: AXUIElement,
         depth: Int,
         maxDepth: Int,
+        row: Int?,
+        rows: inout RowTexts,
         elements: inout [AccessibilityElement],
         nextId: inout Int,
         visited: inout Int,
@@ -94,6 +113,11 @@ enum AXTreeWalker {
         let hasLabel = (label != nil && label != "") || (value != nil && value != "")
         let outcomeLabel = label?.lowercased().hasPrefix("now playing") == true
         let shouldSkip = skipRoles.contains(role) || (role == "AXGroup" && !hasAnyAction && !outcomeLabel)
+        var row = row
+        if rowRoles.contains(role), row == nil { row = rows.next; rows.next += 1 }
+        if let row, let text = label ?? value, !text.isEmpty, (rows.text[row]?.count ?? 0) < 6 {
+            rows.text[row, default: []].append(String(text.prefix(60)))
+        }
 
         if !shouldSkip && hasLabel && (hasAnyAction || isInteractiveRole(role) || role == "AXStaticText" || outcomeLabel) {
             elements.append(AccessibilityElement(
@@ -107,12 +131,13 @@ enum AXTreeWalker {
                 frame: InputController.frame(element),
                 focused: (attribute(kAXFocusedAttribute) as? Bool) ?? false
             ))
+            if let row { rows.rowOf[nextId] = row }
             nextId += 1
         }
 
         guard let children = attribute(kAXChildrenAttribute) as? [AXUIElement] else { return }
         for child in children {
-            enumerate(child, depth: depth + 1, maxDepth: maxDepth, elements: &elements, nextId: &nextId, visited: &visited, deadline: deadline, limit: limit)
+            enumerate(child, depth: depth + 1, maxDepth: maxDepth, row: row, rows: &rows, elements: &elements, nextId: &nextId, visited: &visited, deadline: deadline, limit: limit)
         }
     }
 

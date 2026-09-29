@@ -150,7 +150,9 @@ final class TaskRunner: ActionLayer {
         AXUIElementSetAttributeValue(target.appElement, "AXManualAccessibility" as CFString, kCFBooleanTrue)
         AXUIElementSetAttributeValue(target.appElement, "AXEnhancedUserInterface" as CFString, kCFBooleanTrue)
         var context = context
-        if background, Self.ultrafastEnabled, cdpClient != nil {
+        // Ultrafast works from the DOM for Chromium apps in the background and from the accessibility tree
+        // on screen; background tasks in other apps keep the planner's idle-wait flow.
+        if Self.ultrafastEnabled, !background || cdpClient != nil {
             phase = "fast"
             let fast = try await runFastLoop(task: goal)
             if fast.status == "verified" {
@@ -215,6 +217,15 @@ final class TaskRunner: ActionLayer {
     /// Ultrafast: Jev reads the page and picks the next operation and target in one request per cycle,
     /// and a prompt-only planner call writes text when Jev chooses to type. Returns verified when Jev
     /// judges the task done; anything else hands the task to the planner.
+    /// The field text is most likely needed for: the focused field, else a search box, else the only field.
+    nonisolated static func likelyField(in elements: [AccessibilityElement]) -> AccessibilityElement? {
+        let fields = elements.filter { ["AXTextField", "AXTextArea", "AXComboBox"].contains($0.role) && $0.enabled }
+        if let focused = fields.first(where: \.focused) { return focused }
+        let searchy = ["search", "play", "find", "query", "look"]
+        if let search = fields.first(where: { field in searchy.contains { field.displayLabel.lowercased().contains($0) } }) { return search }
+        return fields.count == 1 ? fields[0] : nil
+    }
+
     private func runFastLoop(task: String) async throws -> StepOutcome {
         fastSettle = true
         defer { fastSettle = false }
@@ -222,15 +233,26 @@ final class TaskRunner: ActionLayer {
         var latest: [AccessibilityElement] = []
         var retriedBlocked = false
         var lastAction: (identity: String, succeeded: Bool)?
+        var lastOperation: String?
+        var filledFields: Set<String> = []
         let writer = CodexClient(credentials: credentials)
+        // Text for the most likely field is written while Jev makes its first decision.
+        var prefetch: (key: String, task: Task<String, Error>)?
+        defer { prefetch?.task.cancel() }
         for iteration in 0..<Self.maxFastActions + 1 {
             try checkFocus()
             delegate?.taskRunner(self, status: "Working… (\(actions))")
             phase = "fast_observing"
             let observation = try await observe()
             latest = observation.elements
+            if prefetch == nil, iteration == 0, let field = Self.likelyField(in: observation.elements) {
+                let screen = CodexAgent.describe(observation.elements)
+                let name = target.name
+                prefetch = (JevClient.fieldKey(field), Task { try await writer.writeText(task: task, field: field, appName: name, screen: screen) })
+            }
             phase = "fast_deciding"
-            let decision = try await jev.nextAction(task: task, elements: observation.elements, appName: target.name, history: taken)
+            let decision = try await jev.nextAction(task: task, elements: observation.elements, appName: target.name,
+                                                    history: taken, lastOperation: lastOperation, filledFields: filledFields)
             Log.info("Fast iteration=\(iteration) operation=\(decision.operation) done=\(String(format: "%.2f", decision.done))")
             if Self.debugGrounding, let chosen = decision.target {
                 Log.info("Debug fast target=\(chosen.displayRole):\(chosen.displayLabel.prefix(40))\(chosen.context.map { " in " + $0.prefix(30) } ?? "")")
@@ -251,13 +273,19 @@ final class TaskRunner: ActionLayer {
             case "CLICK": step = PlanStep(action: "click", target: decision.target?.displayLabel)
             case "TYPE_TEXT":
                 guard let field = decision.target else { continue }
-                let key = field.role + "|" + field.displayLabel
+                let key = JevClient.fieldKey(field)
                 let text: String
-                if let cached = fieldText[key] { text = cached } else {
+                if let cached = fieldText[key] { text = cached }
+                else if let prefetch, prefetch.key == key, let written = try? await prefetch.task.value {
+                    text = written
+                    Log.info("Text prefetch hit")
+                } else {
                     delegate?.taskRunner(self, status: "Writing text…")
-                    text = try await writer.writeText(task: task, field: field, appName: target.name)
-                    fieldText[key] = text
+                    text = try await writer.writeText(task: task, field: field, appName: target.name,
+                                                      screen: CodexAgent.describe(observation.elements))
                 }
+                fieldText[key] = text
+                filledFields.insert(key)
                 step = PlanStep(action: "type", target: field.displayLabel, text: text)
             case "SCROLL_DOWN": step = PlanStep(action: "scroll", direction: "down")
             case "SCROLL_UP": step = PlanStep(action: "scroll", direction: "up")
@@ -268,8 +296,11 @@ final class TaskRunner: ActionLayer {
             let identity = decision.operation + "|" + (decision.target.map { "\($0.role)|\($0.displayLabel)|\($0.context ?? "")" } ?? "")
             if let lastAction, lastAction.identity == identity, !lastAction.succeeded, decision.operation != "WAIT" { break }
             let outcome = try await perform(step: step, pinned: decision.target)
-            lastAction = (identity, outcome.status == "verified" || outcome.status == "sent")
-            taken.append(step.summary + (outcome.succeeded ? "" : " (\(outcome.status))"))
+            let changed = outcome.status == "verified" || outcome.status == "sent"
+            lastAction = (identity, changed)
+            lastOperation = decision.operation
+            let what = decision.operation == "CLICK" ? "click \"\(decision.target?.displayLabel.prefix(60) ?? "")\"" : step.summary
+            taken.append(what + (changed ? " → screen changed" : " → no visible change (\(outcome.status))"))
             latest = outcome.elements
             if ["blocked", "rejected"].contains(outcome.status) { break }
         }

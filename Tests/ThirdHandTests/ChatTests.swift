@@ -209,6 +209,25 @@ final class UltrafastTests: XCTestCase {
         XCTAssertThrowsError(try JevClient.decodeNextAction(Data("{}".utf8), offered: offered))
     }
 
+    func testReturnIsNotOfferedTwiceInARowAndFilledFieldsAreSkipped() throws {
+        let field = el(2, "AXTextField", "Search")
+        let prepared = try JevClient.nextActionRequest(task: "t", elements: [el(1, "AXButton", "Play"), field], appName: "App",
+                                                       history: [], lastOperation: "PRESS_RETURN",
+                                                       filledFields: [JevClient.fieldKey(field)])
+        let body = try JSONSerialization.jsonObject(with: prepared.data) as! [String: Any]
+        let questions = body["questions"] as! [String: [String: Any]]
+        XCTAssertNil((questions["operation"]!["criteria"] as! [String: String])["PRESS_RETURN"])
+        XCTAssertNil(questions["type_text_target"], "A field that already got its text isn't offered")
+        XCTAssertTrue((questions["operation"]!["instructions"] as! String).contains("Submit a populated search field"))
+    }
+
+    func testLikelyFieldForTextPrefetch() {
+        var focused = el(3, "AXTextField", "Name"); focused.focused = true
+        XCTAssertEqual(TaskRunner.likelyField(in: [el(1, "AXTextField", "Email"), focused])?.id, 3)
+        XCTAssertEqual(TaskRunner.likelyField(in: [el(1, "AXTextField", "Email"), el(2, "AXComboBox", "What do you want to play?")])?.id, 2)
+        XCTAssertNil(TaskRunner.likelyField(in: [el(1, "AXTextField", "Email"), el(2, "AXTextField", "Name")]), "Ambiguous: no prefetch")
+    }
+
     func testPlannerHasNoGoalSteps() {
         XCTAssertFalse(PlanStep.actions.contains("goal"))
         XCTAssertThrowsError(try PlanStep.parse(["action": "goal", "text": "x"]).get())
