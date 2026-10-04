@@ -150,8 +150,13 @@ final class ChatController: ObservableObject, TaskRunnerDelegate {
             return (running, true)
         }
         if SkyLight.isAvailable {
+            // Minimized or hidden windows are brought up out of sight by the task; asking the app to
+            // reopen would show them on screen.
+            if let running, !WindowParking.windows(of: AXUIElementCreateApplication(running.processIdentifier)).isEmpty {
+                return (running, true)
+            }
             let previous = NSWorkspace.shared.frontmostApplication
-            let app = try await AppCatalog.prepare(job.app)
+            let app = try await AppCatalog.prepare(job.app, hidden: running == nil)
             Task { await BackgroundInput.keepBehind(app, restoring: previous) }
             return (app, true)
         }

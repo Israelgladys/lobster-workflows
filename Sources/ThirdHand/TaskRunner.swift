@@ -42,6 +42,8 @@ final class TaskRunner: ActionLayer {
     /// The user's front app and the time of the last input addressed to the target's window.
     private var userApp: NSRunningApplication?
     private var lastWindowInput = Date.distantPast
+    /// A minimized or hidden window brought onto an invisible display for the task.
+    private var parking: WindowParking?
     private lazy var jev = JevClient(apiKey: apiKey)
 
     init(target: AppTarget, goal: String, apiKey: String, credentials: CodexCredentials, context: [String] = [],
@@ -100,6 +102,15 @@ final class TaskRunner: ActionLayer {
             }
         }
         defer { watchdog.cancel() }
+        await report()
+        if let parking {
+            // A stopped task is cancelled; restoring runs in its own task so it still completes.
+            await Task { await parking.restore() }.value
+            self.parking = nil
+        }
+    }
+
+    private func report() async {
         do {
             try await runAgent()
         } catch is CancellationError {
@@ -122,10 +133,20 @@ final class TaskRunner: ActionLayer {
         let debugPort = background ? await ElectronDetector.findDebugPort(pid: target.pid) : nil
         if background, debugPort == nil {
             try BackgroundInput.ensureAvailable()
+            func needsParking() -> Bool {
+                target.application.isHidden || (WindowSnapshot.frontWindow(pid: target.pid) == nil
+                    && WindowParking.windows(of: target.appElement).contains { WindowParking.bool($0, kAXMinimizedAttribute) })
+            }
             // A window that just opened may still be moving into place.
-            for _ in 0..<20 where WindowSnapshot.frontWindow(pid: target.pid) == nil {
+            for _ in 0..<20 where WindowSnapshot.frontWindow(pid: target.pid) == nil && !needsParking() {
                 try checkFocus()
                 try await Task.sleep(nanoseconds: 250_000_000)
+            }
+            if needsParking() {
+                delegate?.taskRunner(self, status: "Opening \(target.name) out of sight…")
+                let parking = WindowParking(target: target)
+                self.parking = parking
+                try await parking.park(appName: target.name)
             }
             Log.info("Background control via=window_input")
             watchForActivation()

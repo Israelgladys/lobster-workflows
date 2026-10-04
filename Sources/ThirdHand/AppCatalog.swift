@@ -82,7 +82,8 @@ final class AppCatalog: ObservableObject {
     }
 
     /// Launches the app if needed (or asks a running app with no window to reopen one) and waits for a window.
-    static func prepare(_ app: ChatApp, timeout: TimeInterval = 15) async throws -> NSRunningApplication {
+    /// `hidden` launches it hidden, for background control to bring its window up out of sight.
+    static func prepare(_ app: ChatApp, hidden: Bool = false, timeout: TimeInterval = 15) async throws -> NSRunningApplication {
         let running = NSRunningApplication.runningApplications(withBundleIdentifier: app.bundleID).first { !$0.isTerminated }
         if let running, WindowSnapshot.frontWindow(pid: running.processIdentifier) != nil { return running }
         guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: app.bundleID) else {
@@ -91,12 +92,14 @@ final class AppCatalog: ObservableObject {
         let configuration = NSWorkspace.OpenConfiguration()
         // Stay in the chat while the planner reads the app; it comes forward before the first input.
         configuration.activates = false
-        Log.info("Opening app bundle=\(app.bundleID) running=\(running != nil)")
+        configuration.hides = hidden
+        Log.info("Opening app bundle=\(app.bundleID) running=\(running != nil) hidden=\(hidden)")
         let launched = try await NSWorkspace.shared.openApplication(at: url, configuration: configuration)
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
             try Task.checkCancellation()
             if WindowSnapshot.frontWindow(pid: launched.processIdentifier) != nil { return launched }
+            if hidden, !WindowParking.windows(of: AXUIElementCreateApplication(launched.processIdentifier)).isEmpty { return launched }
             try await Task.sleep(nanoseconds: 250_000_000)
         }
         throw ControllerError.invalid("\(app.name) didn't open a window in time.")
