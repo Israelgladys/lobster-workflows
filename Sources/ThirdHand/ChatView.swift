@@ -27,11 +27,15 @@ struct MainView: View {
                 .frame(width: 250)
             Rectangle().fill(Theme.border).frame(width: 1)
             VStack(spacing: 0) {
-                if !setup.isReady { SetupBanner(setup: setup) }
-                if let id = store.selection, let thread = store.thread(id) {
-                    ThreadView(chat: chat, thread: thread)
+                if setup.showingSettings {
+                    SettingsView(setup: setup)
                 } else {
-                    EmptyState(chat: chat)
+                    if !setup.isReady { SetupBanner(setup: setup) }
+                    if let id = store.selection, let thread = store.thread(id) {
+                        ThreadView(chat: chat, thread: thread)
+                    } else {
+                        EmptyState(chat: chat)
+                    }
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -42,6 +46,7 @@ struct MainView: View {
         .ignoresSafeArea()
         .frame(minWidth: 760, minHeight: 480)
         .preferredColorScheme(.dark)
+        .onChange(of: store.selection) { setup.showingSettings = false }
     }
 }
 
@@ -53,7 +58,7 @@ private struct SetupBanner: View {
             Circle().fill(Color.yellow).frame(width: 7, height: 7)
             Text("Finish setup to let Third Hand control apps").font(.system(size: 13))
             Spacer()
-            Button("Open Setup") { setup.showSetup() }.buttonStyle(PillButtonStyle())
+            Button("Finish Setup") { setup.showSetup() }.buttonStyle(PillButtonStyle())
         }
         .padding(.horizontal, 20).padding(.top, 40).padding(.bottom, 12)
         .background(Theme.surface)
@@ -74,6 +79,97 @@ private struct EmptyState: View {
                 .padding(.top, 4)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
+// MARK: - Settings
+
+private struct SettingsView: View {
+    @ObservedObject var setup: AppDelegate
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 22) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Settings").font(.system(size: 20, weight: .semibold))
+                    Text(setup.isReady ? "Ready when you are." : "Finish these to let Third Hand control apps.")
+                        .font(.system(size: 13)).foregroundStyle(Theme.secondary)
+                }
+
+                section("Permissions") {
+                    row(setup.accessibilityReady, "Accessibility", setup.accessibilityReady ? "Enabled" : "Needed to read and control apps") {
+                        Button(setup.accessibilityReady ? "Open Settings" : "Enable") {
+                            if setup.accessibilityReady { setup.openPrivacySettings("Privacy_Accessibility") } else { setup.promptAccessibility() }
+                        }.buttonStyle(PillButtonStyle(prominent: !setup.accessibilityReady))
+                    }
+                    divider
+                    row(setup.screenReady, "Screen Recording", setup.screenReady ? "Enabled" : "Needed for on-device text recognition") {
+                        Button(setup.screenReady ? "Open Settings" : "Enable") {
+                            if setup.screenReady { setup.openPrivacySettings("Privacy_ScreenCapture") } else { setup.promptScreenRecording() }
+                        }.buttonStyle(PillButtonStyle(prominent: !setup.screenReady))
+                    }
+                    divider
+                    row(setup.shortcutReady, "Control–Space", setup.shortcutReady ? "Starts a thread with the app in front" : "Waiting for Accessibility access") {
+                        EmptyView()
+                    }
+                }
+
+                section("Accounts") {
+                    row(setup.codexReady, "ChatGPT",
+                        setup.codexAccount ?? (setup.codexSigningIn ? "Finish signing in in your browser…" : "Plans each step using your ChatGPT plan")) {
+                        if setup.codexReady {
+                            Button("Sign Out") { setup.signOutOfChatGPT() }.buttonStyle(PillButtonStyle())
+                        } else {
+                            Button("Sign in with ChatGPT") { setup.signInWithChatGPT() }
+                                .buttonStyle(PillButtonStyle(prominent: true)).disabled(setup.codexSigningIn)
+                        }
+                    }
+                    divider
+                    row(setup.keyReady, "Jev API key", setup.keyReady ? "Loaded from Keychain" : "Needs setup or Keychain approval") {
+                        Button(setup.keyReady ? "Change" : "Set Key") { setup.promptAPIKey() }
+                            .buttonStyle(PillButtonStyle(prominent: !setup.keyReady))
+                    }
+                }
+
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Screen reading stays on-device. ChatGPT plans each step and writes any text; Jev finds the control. Your request and screen text are sent to OpenAI and TypeSafe.")
+                    Text("If macOS asks you to quit and reopen after enabling access, reopen this copy of Third Hand.")
+                    Button("Show App in Finder") { NSWorkspace.shared.activateFileViewerSelecting([Bundle.main.bundleURL]) }
+                        .buttonStyle(.plain).foregroundStyle(Theme.accent)
+                }
+                .font(.system(size: 12)).foregroundStyle(Theme.tertiary).lineSpacing(2)
+            }
+            .frame(maxWidth: 560, alignment: .leading)
+            .padding(.horizontal, 32).padding(.top, 48).padding(.bottom, 32)
+            .frame(maxWidth: .infinity)
+        }
+    }
+
+    private var divider: some View { Rectangle().fill(Theme.border).frame(height: 1).padding(.leading, 40) }
+
+    private func section<Content: View>(_ title: String, @ViewBuilder _ content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title.uppercased()).font(.system(size: 10, weight: .semibold)).tracking(0.8).foregroundStyle(Theme.tertiary)
+            VStack(spacing: 0) { content() }
+                .background(RoundedRectangle(cornerRadius: 10).fill(Theme.surface))
+                .overlay(RoundedRectangle(cornerRadius: 10).stroke(Theme.border))
+        }
+    }
+
+    private func row<Accessory: View>(_ ok: Bool, _ title: String, _ detail: String,
+                                      @ViewBuilder accessory: () -> Accessory) -> some View {
+        HStack(spacing: 12) {
+            Image(systemName: ok ? "checkmark.circle.fill" : "circle.dashed")
+                .font(.system(size: 16)).foregroundStyle(ok ? Theme.success : Color.yellow)
+                .frame(width: 16)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title).font(.system(size: 13, weight: .medium))
+                Text(detail).font(.system(size: 12)).foregroundStyle(Theme.secondary).lineLimit(1)
+            }
+            Spacer(minLength: 12)
+            accessory()
+        }
+        .padding(.horizontal, 12).padding(.vertical, 11)
     }
 }
 
@@ -104,7 +200,7 @@ private struct Sidebar: View {
                 LazyVStack(spacing: 2) {
                     ForEach(store.sorted) { thread in
                         ThreadRow(thread: thread, selected: store.selection == thread.id, catalog: chat.catalog)
-                            .onTapGesture { store.selection = thread.id }
+                            .onTapGesture { store.selection = thread.id; setup.showingSettings = false }
                             .contextMenu { Button("Delete Thread", role: .destructive) { store.delete(thread.id) } }
                     }
                 }
@@ -112,14 +208,15 @@ private struct Sidebar: View {
             }
 
             Spacer(minLength: 0)
-            Button { setup.showSetup() } label: {
+            Button { setup.showingSettings ? (setup.showingSettings = false) : setup.showSetup() } label: {
                 HStack(spacing: 8) {
                     Circle().fill(setup.isReady ? Theme.success : Color.yellow).frame(width: 7, height: 7)
-                    Text(setup.codexAccount ?? "Setup").font(.system(size: 12)).lineLimit(1)
+                    Text(setup.codexAccount ?? "Settings").font(.system(size: 12)).lineLimit(1)
                     Spacer()
                     Image(systemName: "gearshape").font(.system(size: 12))
                 }
-                .foregroundStyle(Theme.secondary)
+                .foregroundStyle(setup.showingSettings ? Theme.text : Theme.secondary)
+                .background(setup.showingSettings ? Theme.raised.opacity(0.5) : .clear)
                 .padding(.horizontal, 16).padding(.vertical, 12)
                 .contentShape(Rectangle())
             }

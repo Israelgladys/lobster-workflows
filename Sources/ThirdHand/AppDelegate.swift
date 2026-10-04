@@ -7,7 +7,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     private var hotkeyManager: HotkeyManager?
     private var didStart = false
     private var mainWindow: NSWindow?
-    private var setupWindow: NSWindow?
     private var permissionTimer: Timer?
     private var apiKey: String?
     private var codexCredentials: CodexCredentials?
@@ -19,6 +18,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     @Published var keyReady = false
     @Published var codexAccount: String?
     @Published var codexSigningIn = false
+    /// The main window shows settings in place of the thread pane.
+    @Published var showingSettings = false
     var codexReady: Bool { codexAccount != nil }
     var isReady: Bool { accessibilityReady && keyReady && codexReady }
 
@@ -84,19 +85,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     }
 
     func showSetup() {
-        if setupWindow == nil {
-            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 540, height: 520),
-                                  styleMask: [.titled, .closable], backing: .buffered, defer: false)
-            window.title = "Third Hand Setup"
-            window.appearance = NSAppearance(named: .darkAqua)
-            window.backgroundColor = .black
-            window.isReleasedWhenClosed = false
-            window.contentView = NSHostingView(rootView: SetupView(delegate: self))
-            window.center()
-            setupWindow = window
-        }
-        setupWindow?.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
+        showingSettings = true
+        showMain()
     }
 
     private var lastPermissionState = ""
@@ -147,8 +137,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     }
 
     private func useCodex(_ tokens: CodexTokens) {
-        codexCredentials = CodexCredentials(tokens: tokens)
+        let credentials = CodexCredentials(tokens: tokens)
+        codexCredentials = credentials
         codexAccount = tokens.email ?? "ChatGPT account"
+        Task {
+            do {
+                let models = try await CodexClient(credentials: credentials).availableModels()
+                Log.info("ChatGPT plan models: \(models.joined(separator: ", "))")
+                if !models.isEmpty, !models.contains(CodexClient.strongModel) {
+                    Log.info("Planner model \(CodexClient.strongModel) is not in this plan's model list")
+                }
+            } catch { Log.info("ChatGPT model list failed: \(error.localizedDescription)") }
+        }
     }
 
     func signInWithChatGPT() {
@@ -157,11 +157,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         Task {
             defer { codexSigningIn = false }
             do {
-                let tokens = try await CodexAuth.signIn()
+                let tokens = try await CodexAuth.signIn(previous: KeychainHelper.getCodexTokens())
                 try KeychainHelper.saveCodexTokens(tokens)
                 useCodex(tokens)
                 Log.info("ChatGPT sign-in succeeded")
-                if isReady { setupWindow?.close(); showMain() } else { showSetup() }
+                showSetup()
             } catch is CancellationError {
             } catch {
                 Log.info("ChatGPT sign-in failed")
@@ -210,65 +210,5 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
                 }
             }
         }
-    }
-}
-
-struct SetupView: View {
-    @ObservedObject var delegate: AppDelegate
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            HStack(spacing: 12) {
-                Image(nsImage: NSApplication.shared.applicationIconImage).resizable().frame(width: 48, height: 48)
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("Third Hand").font(.title2.bold())
-                    Text(delegate.accessibilityReady && delegate.keyReady && delegate.codexReady ? "Ready when you are" : "Let’s get set up")
-                        .foregroundStyle(.secondary)
-                }
-            }
-            Text("Tag an app with @ in a thread, or press Control–Space in any app to start a thread with it.")
-            HStack {
-                Text(delegate.accessibilityReady ? "✓ Accessibility enabled" : "Accessibility access needed")
-                Spacer()
-                Button(delegate.accessibilityReady ? "Settings…" : "Enable…") {
-                    if delegate.accessibilityReady { delegate.openPrivacySettings("Privacy_Accessibility") }
-                    else { delegate.promptAccessibility() }
-                }
-            }
-            HStack {
-                Text(delegate.screenReady ? "✓ Screen Recording enabled" : "Screen Recording needed for local OCR")
-                Spacer()
-                Button(delegate.screenReady ? "Settings…" : "Enable…") {
-                    if delegate.screenReady { delegate.openPrivacySettings("Privacy_ScreenCapture") }
-                    else { delegate.promptScreenRecording() }
-                }
-            }
-            HStack {
-                Text(delegate.keyReady ? "✓ API key loaded" : "API key needs setup or Keychain approval")
-                Spacer()
-                Button("Set API Key…") { delegate.promptAPIKey() }
-            }
-            HStack {
-                Text(delegate.codexAccount.map { "✓ Signed in with ChatGPT (\($0))" }
-                     ?? (delegate.codexSigningIn ? "Finish signing in in your browser…" : "ChatGPT sign-in needed for planning"))
-                Spacer()
-                if delegate.codexReady {
-                    Button("Sign Out") { delegate.signOutOfChatGPT() }
-                } else {
-                    Button("Sign in with ChatGPT…") { delegate.signInWithChatGPT() }.disabled(delegate.codexSigningIn)
-                }
-            }
-            Text("Screen reading stays on-device. ChatGPT plans each step and writes any text; Jev finds the control. Your request and screen text are sent to OpenAI and TypeSafe.")
-                .font(.caption).foregroundStyle(.secondary)
-            Text(delegate.shortcutReady ? "✓ Control–Space is ready" : "Shortcut waiting for Accessibility access")
-                .foregroundStyle(.secondary)
-            Divider()
-            Text("If macOS asks you to quit and reopen after enabling access, reopen this copy of Third Hand.")
-                .font(.caption).foregroundStyle(.secondary)
-            Button("Show App in Finder") { NSWorkspace.shared.activateFileViewerSelecting([Bundle.main.bundleURL]) }
-                .font(.caption)
-        }
-        .padding(24)
-        .frame(width: 540)
     }
 }

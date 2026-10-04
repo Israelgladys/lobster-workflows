@@ -2,14 +2,18 @@ import AppKit
 import CryptoKit
 import Foundation
 import Network
+import Security
 
 struct CodexTokens: Codable, Equatable {
     var access: String
     var refresh: String
     var expires: Date
-    var accountId: String
+    /// The client ID OpenAI issued to this installation at first sign-in.
+    var clientID: String
     var subject: String
     var email: String?
+    /// Kept for `id_token_hint` on the next sign-in.
+    var idToken: String?
 }
 
 struct CodexAuthError: LocalizedError {
@@ -17,12 +21,38 @@ struct CodexAuthError: LocalizedError {
     var errorDescription: String? { message }
 }
 
-/// ChatGPT sign-in for the Codex backend: browser OAuth with PKCE and a loopback callback.
+/// Official Sign in with ChatGPT for open-source apps: plan usage through OAuth with PKCE and a loopback callback.
+/// See https://developers.openai.com/siwc/token-sharing-open-source/sign-in
 enum CodexAuth {
     nonisolated static let issuer = "https://auth.openai.com"
-    nonisolated static let clientID = "app_EMoamEEZ73f0CkXaXp7hrann"
+    nonisolated static let authorizeEndpoint = issuer + "/api/accounts/authorize"
+    nonisolated static let tokenEndpoint = issuer + "/api/accounts/oauth/token"
+    nonisolated static let jwksEndpoint = issuer + "/.well-known/jwks.json"
+    /// First sign-in registers with this client ID; OpenAI returns the issued one in the callback.
+    nonisolated static let registrationClientID = "dynamic_agent_client"
+    nonisolated static let agentName = "Third Hand"
+    nonisolated static let resource = "https://api.openai.com/v1"
+    nonisolated static let planScope = "chatgpt.tokens.use.direct"
+    nonisolated static let scope = "openid profile email offline_access resource.invoke " + planScope
     nonisolated static let callbackPort: UInt16 = 1455
-    nonisolated static let redirectURI = "http://localhost:1455/auth/callback"
+    nonisolated static let redirectURI = "http://127.0.0.1:1455/auth/callback"
+    /// Refresh errors after which the stored tokens are useless.
+    nonisolated static let terminalRefreshErrors: Set<String> = ["invalid_grant", "invalid_refresh_token", "token_expired",
+        "refresh_token_expired", "refresh_token_invalidated", "refresh_token_reused"]
+
+    /// The client ID issued at first registration, reused for every later sign-in on this Mac.
+    nonisolated static var issuedClientID: String? {
+        get { UserDefaults.standard.string(forKey: "ChatGPTClientID") }
+        set { UserDefaults.standard.set(newValue, forKey: "ChatGPTClientID") }
+    }
+
+    /// Stable per-Mac host identifier that OpenAI requires alongside the agent name.
+    nonisolated static var hostID: String {
+        if let id = UserDefaults.standard.string(forKey: "ChatGPTHostID") { return id }
+        let id = "urn:uuid:" + UUID().uuidString.lowercased()
+        UserDefaults.standard.set(id, forKey: "ChatGPTHostID")
+        return id
+    }
 
     struct PKCE {
         let verifier: String
@@ -36,6 +66,12 @@ enum CodexAuth {
             .replacingOccurrences(of: "=", with: "")
     }
 
+    nonisolated static func base64URLDecode(_ text: Substring) -> Data? {
+        var payload = String(text).replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
+        payload += String(repeating: "=", count: (4 - payload.count % 4) % 4)
+        return Data(base64Encoded: payload)
+    }
+
     nonisolated static func randomBytes(_ count: Int) -> Data {
         var generator = SystemRandomNumberGenerator()
         return Data((0..<count).map { _ in UInt8.random(in: .min ... .max, using: &generator) })
@@ -47,97 +83,189 @@ enum CodexAuth {
         return PKCE(verifier: verifier, challenge: challenge)
     }
 
-    nonisolated static func authorizeURL(pkce: PKCE, state: String) -> URL {
-        var components = URLComponents(string: issuer + "/oauth/authorize")!
-        components.queryItems = [
+    nonisolated static func authorizeURL(pkce: PKCE, state: String, nonce: String, clientID: String?,
+                                         hostID: String, idTokenHint: String? = nil) -> URL {
+        var components = URLComponents(string: authorizeEndpoint)!
+        var items = [
             URLQueryItem(name: "response_type", value: "code"),
-            URLQueryItem(name: "client_id", value: clientID),
+            URLQueryItem(name: "client_id", value: clientID ?? registrationClientID),
+            URLQueryItem(name: "agent_name_hint", value: agentName),
+            URLQueryItem(name: "ext_agent_host_id", value: hostID),
             URLQueryItem(name: "redirect_uri", value: redirectURI),
-            URLQueryItem(name: "scope", value: "openid profile email offline_access"),
+            URLQueryItem(name: "scope", value: scope),
+            URLQueryItem(name: "resource", value: resource),
             URLQueryItem(name: "code_challenge", value: pkce.challenge),
             URLQueryItem(name: "code_challenge_method", value: "S256"),
-            URLQueryItem(name: "id_token_add_organizations", value: "true"),
-            URLQueryItem(name: "codex_cli_simplified_flow", value: "true"),
             URLQueryItem(name: "state", value: state),
-            URLQueryItem(name: "originator", value: CodexClient.originator)
+            URLQueryItem(name: "nonce", value: nonce)
         ]
+        if let idTokenHint { items.append(URLQueryItem(name: "id_token_hint", value: idTokenHint)) }
+        components.queryItems = items
+        // URLComponents leaves "+" unescaped, which query decoding reads as a space.
+        components.percentEncodedQuery = components.percentEncodedQuery?.replacingOccurrences(of: "+", with: "%2B")
         return components.url!
     }
 
-    nonisolated static func claims(_ token: String?) -> [String: Any] {
-        let parts = token?.split(separator: ".") ?? []
-        guard parts.count == 3 else { return [:] }
-        var payload = String(parts[1]).replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
-        payload += String(repeating: "=", count: (4 - payload.count % 4) % 4)
-        guard let data = Data(base64Encoded: payload),
+    /// Decodes a JWT segment without verifying it; `IDToken.verify` checks signatures.
+    nonisolated static func claims(_ token: String?, segment: Int = 1) -> [String: Any] {
+        let parts = token?.split(separator: ".", omittingEmptySubsequences: false) ?? []
+        guard parts.count == 3, let data = base64URLDecode(parts[segment]),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return [:] }
         return json
     }
 
-    /// Account and subject must stay the same across refreshes; a different account means signing in again.
-    nonisolated static func normalize(_ raw: [String: Any], previous: CodexTokens? = nil, now: Date = Date()) throws -> CodexTokens {
-        let identity = claims(raw["id_token"] as? String)
-        let access = claims(raw["access_token"] as? String)
-        func account(_ claims: [String: Any]) -> String? {
-            (claims["https://api.openai.com/auth"] as? [String: Any])?["chatgpt_account_id"] as? String
-                ?? claims["chatgpt_account_id"] as? String
-        }
-        let accountId = account(identity) ?? account(access) ?? previous?.accountId
-        let subject = identity["sub"] as? String ?? access["sub"] as? String ?? previous?.subject
+    /// `identity` is the verified ID token's claims, when the response carried one.
+    /// The subject must stay the same across refreshes; a different account means signing in again.
+    nonisolated static func normalize(_ raw: [String: Any], identity: [String: Any], clientID: String,
+                                      previous: CodexTokens? = nil, now: Date = Date()) throws -> CodexTokens {
+        let subject = identity["sub"] as? String ?? previous?.subject
         guard let subject, !subject.isEmpty, previous == nil || previous?.subject == subject else {
             throw CodexAuthError(message: "Sign in with ChatGPT again to confirm your account.")
         }
-        guard let accessToken = raw["access_token"] as? String, let accountId,
-              previous == nil || previous?.accountId == accountId else {
-            throw CodexAuthError(message: "ChatGPT did not return a usable Codex account.")
+        guard let accessToken = raw["access_token"] as? String, !accessToken.isEmpty else {
+            throw CodexAuthError(message: "ChatGPT did not return an access token. Sign in again.")
+        }
+        // A refresh may omit scope; it keeps what was granted at sign-in.
+        if previous == nil || raw["scope"] != nil {
+            let granted = (raw["scope"] as? String ?? "").split(separator: " ").map(String.init)
+            guard granted.contains(planScope) else {
+                throw CodexAuthError(message: "ChatGPT plan usage was not enabled for Third Hand. Sign in again and allow it, or check that your plan supports third-party apps.")
+            }
         }
         guard let refresh = raw["refresh_token"] as? String ?? previous?.refresh else {
             throw CodexAuthError(message: "ChatGPT did not return a refresh token. Sign in again.")
         }
         let lifetime = (raw["expires_in"] as? Double) ?? 3600
         return CodexTokens(access: accessToken, refresh: refresh, expires: now.addingTimeInterval(lifetime),
-                           accountId: accountId, subject: subject,
-                           email: identity["email"] as? String ?? previous?.email)
+                           clientID: clientID, subject: subject,
+                           email: identity["email"] as? String ?? previous?.email,
+                           idToken: raw["id_token"] as? String ?? previous?.idToken)
     }
 
     nonisolated static func tokenRequest(_ params: [String: String]) -> URLRequest {
-        var request = URLRequest(url: URL(string: issuer + "/oauth/token")!, timeoutInterval: 20)
+        var request = URLRequest(url: URL(string: tokenEndpoint)!, timeoutInterval: 20)
         request.httpMethod = "POST"
         request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
         var form = URLComponents()
-        form.queryItems = params.merging(["client_id": clientID]) { a, _ in a }
-            .sorted { $0.key < $1.key }
-            .map { URLQueryItem(name: $0.key, value: $0.value) }
+        form.queryItems = params.sorted { $0.key < $1.key }.map { URLQueryItem(name: $0.key, value: $0.value) }
         // URLComponents leaves "+" unescaped, which form decoding reads as a space.
         request.httpBody = Data((form.percentEncodedQuery ?? "").replacingOccurrences(of: "+", with: "%2B").utf8)
         return request
     }
 
-    nonisolated static func requestTokens(_ params: [String: String], previous: CodexTokens? = nil,
-                                          session: URLSession) async throws -> CodexTokens {
-        let (data, response) = try await session.data(for: tokenRequest(params))
-        guard (response as? HTTPURLResponse)?.statusCode == 200,
-              let raw = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            throw CodexAuthError(message: "ChatGPT authorization expired or was declined. Sign in again.")
+    /// `nonce` is checked for sign-in; refreshes carry none.
+    nonisolated static func requestTokens(_ params: [String: String], clientID: String, nonce: String? = nil,
+                                          previous: CodexTokens? = nil, session: URLSession,
+                                          keys: IDToken.KeyProvider? = nil) async throws -> CodexTokens {
+        let all = params.merging(["client_id": clientID, "resource": resource]) { a, _ in a }
+        let (data, response) = try await session.data(for: tokenRequest(all))
+        let raw = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+        guard (response as? HTTPURLResponse)?.statusCode == 200 else {
+            let code = raw["error"] as? String ?? ""
+            Log.info("ChatGPT token error HTTP \((response as? HTTPURLResponse)?.statusCode ?? 0) code=\(code)")
+            throw CodexRefreshError(terminal: terminalRefreshErrors.contains(code),
+                                    message: "ChatGPT authorization expired or was declined. Sign in again.")
         }
-        return try normalize(raw, previous: previous)
+        var identity: [String: Any] = [:]
+        if let idToken = raw["id_token"] as? String {
+            identity = try await IDToken.verify(idToken, clientID: clientID, nonce: nonce,
+                                                keys: keys ?? IDToken.remoteKeys(session: session))
+        } else if previous == nil {
+            throw CodexAuthError(message: "ChatGPT did not return an identity token. Sign in again.")
+        }
+        return try normalize(raw, identity: identity, clientID: clientID, previous: previous)
     }
 
     /// Opens the browser and waits for the loopback callback.
     @MainActor
-    static func signIn(session: URLSession = .shared,
+    static func signIn(previous: CodexTokens? = nil, session: URLSession = .shared,
                        open: (URL) -> Void = { NSWorkspace.shared.open($0) }) async throws -> CodexTokens {
         let pkce = makePKCE()
         let state = base64URL(randomBytes(32))
+        let nonce = base64URL(randomBytes(32))
         let server = CodexCallbackServer(state: state)
         try await server.start()
         defer { server.stop() }
-        open(authorizeURL(pkce: pkce, state: state))
-        let code = try await AsyncTimeout.run(seconds: 300, message: "ChatGPT sign-in timed out. Try again.") {
-            try await server.code()
+        let known = issuedClientID
+        open(authorizeURL(pkce: pkce, state: state, nonce: nonce, clientID: known, hostID: hostID,
+                          idTokenHint: known != nil && previous?.clientID == known ? previous?.idToken : nil))
+        let callback = try await AsyncTimeout.run(seconds: 300, message: "ChatGPT sign-in timed out. Try again.") {
+            try await server.callback()
         }
-        return try await requestTokens(["grant_type": "authorization_code", "code": code,
-                                        "redirect_uri": redirectURI, "code_verifier": pkce.verifier], session: session)
+        guard let clientID = callback.clientID ?? known else {
+            throw CodexAuthError(message: "ChatGPT did not register Third Hand. Try signing in again.")
+        }
+        let tokens = try await requestTokens(["grant_type": "authorization_code", "code": callback.code,
+                                              "redirect_uri": redirectURI, "code_verifier": pkce.verifier],
+                                             clientID: clientID, nonce: nonce, session: session)
+        issuedClientID = clientID
+        return tokens
+    }
+}
+
+struct CodexRefreshError: LocalizedError {
+    /// True when the refresh token can never work again and must be discarded.
+    let terminal: Bool
+    let message: String
+    var errorDescription: String? { message }
+}
+
+/// Verifies OpenAI ID tokens: RS256 signature against the published JWKS, then issuer, audience, expiry and nonce.
+enum IDToken {
+    typealias KeyProvider = @Sendable (_ kid: String?) async throws -> SecKey
+
+    nonisolated static func verify(_ token: String, clientID: String, nonce: String?, keys: KeyProvider,
+                                   now: Date = Date()) async throws -> [String: Any] {
+        let invalid = CodexAuthError(message: "ChatGPT returned an identity token Third Hand could not verify. Sign in again.")
+        let parts = token.split(separator: ".", omittingEmptySubsequences: false)
+        let header = CodexAuth.claims(token, segment: 0)
+        guard parts.count == 3, header["alg"] as? String == "RS256",
+              let signature = CodexAuth.base64URLDecode(parts[2]) else { throw invalid }
+        let key = try await keys(header["kid"] as? String)
+        let signed = Data((parts[0] + "." + parts[1]).utf8)
+        guard SecKeyVerifySignature(key, .rsaSignatureMessagePKCS1v15SHA256, signed as CFData, signature as CFData, nil) else {
+            throw invalid
+        }
+        let claims = CodexAuth.claims(token)
+        let audience = (claims["aud"] as? [String]) ?? [claims["aud"] as? String].compactMap { $0 }
+        guard claims["iss"] as? String == CodexAuth.issuer, audience.contains(clientID),
+              let exp = claims["exp"] as? Double, Date(timeIntervalSince1970: exp) > now.addingTimeInterval(-60),
+              nonce == nil || claims["nonce"] as? String == nonce else { throw invalid }
+        return claims
+    }
+
+    nonisolated static func remoteKeys(session: URLSession) -> KeyProvider {
+        { kid in
+            let (data, _) = try await session.data(from: URL(string: CodexAuth.jwksEndpoint)!)
+            let keys = ((try? JSONSerialization.jsonObject(with: data)) as? [String: Any])?["keys"] as? [[String: Any]] ?? []
+            guard let jwk = keys.first(where: { kid == nil || $0["kid"] as? String == kid }),
+                  let key = rsaKey(jwk) else {
+                throw CodexAuthError(message: "Could not load ChatGPT's signing keys. Try again.")
+            }
+            return key
+        }
+    }
+
+    /// Builds an RSA public key from a JWK's modulus and exponent (PKCS#1 RSAPublicKey DER).
+    nonisolated static func rsaKey(_ jwk: [String: Any]) -> SecKey? {
+        guard jwk["kty"] as? String == "RSA",
+              let n = (jwk["n"] as? String).flatMap({ CodexAuth.base64URLDecode(Substring($0)) }),
+              let e = (jwk["e"] as? String).flatMap({ CodexAuth.base64URLDecode(Substring($0)) }) else { return nil }
+        func length(_ count: Int) -> [UInt8] {
+            if count < 0x80 { return [UInt8(count)] }
+            let bytes = withUnsafeBytes(of: UInt32(count).bigEndian, Array.init).drop { $0 == 0 }
+            return [0x80 | UInt8(bytes.count)] + bytes
+        }
+        func integer(_ value: Data) -> [UInt8] {
+            var bytes = Array(value.drop { $0 == 0 })
+            if bytes.isEmpty || bytes[0] & 0x80 != 0 { bytes.insert(0, at: 0) }
+            return [0x02] + length(bytes.count) + bytes
+        }
+        let body = integer(n) + integer(e)
+        let der = Data([0x30] + length(body.count) + body)
+        let attributes: [String: Any] = [kSecAttrKeyType as String: kSecAttrKeyTypeRSA,
+                                         kSecAttrKeyClass as String: kSecAttrKeyClassPublic]
+        return SecKeyCreateWithData(der as CFData, attributes as CFDictionary, nil)
     }
 }
 
@@ -147,12 +275,18 @@ actor CodexCredentials {
     private var refreshing: Task<CodexTokens, Error>?
     private let session: URLSession
     private let persist: @Sendable (CodexTokens) throws -> Void
+    private let forget: @Sendable () -> Void
+    private let keys: IDToken.KeyProvider?
 
     init(tokens: CodexTokens, session: URLSession = .shared,
-         persist: @escaping @Sendable (CodexTokens) throws -> Void = { try KeychainHelper.saveCodexTokens($0) }) {
+         persist: @escaping @Sendable (CodexTokens) throws -> Void = { try KeychainHelper.saveCodexTokens($0) },
+         forget: @escaping @Sendable () -> Void = { KeychainHelper.deleteCodexTokens() },
+         keys: IDToken.KeyProvider? = nil) {
         self.tokens = tokens
         self.session = session
         self.persist = persist
+        self.forget = forget
+        self.keys = keys
     }
 
     func current(now: Date = Date()) async throws -> CodexTokens {
@@ -160,18 +294,30 @@ actor CodexCredentials {
         if let refreshing { return try await refreshing.value }
         let previous = tokens
         let session = session
+        let keys = keys
         let task = Task {
             try await CodexAuth.requestTokens(["grant_type": "refresh_token", "refresh_token": previous.refresh],
-                                              previous: previous, session: session)
+                                              clientID: previous.clientID, previous: previous, session: session, keys: keys)
         }
         refreshing = task
         defer { refreshing = nil }
-        let fresh = try await task.value
-        tokens = fresh
-        try persist(fresh)
-        Log.info("Codex token refreshed")
-        return fresh
+        do {
+            let fresh = try await task.value
+            tokens = fresh
+            try persist(fresh)
+            Log.info("ChatGPT token refreshed")
+            return fresh
+        } catch let error as CodexRefreshError where error.terminal {
+            forget()
+            throw error
+        }
     }
+}
+
+/// A new registration also returns the issued client ID.
+struct OAuthCallback: Equatable {
+    let code: String
+    let clientID: String?
 }
 
 /// Minimal loopback HTTP listener for the OAuth redirect.
@@ -179,8 +325,8 @@ final class CodexCallbackServer: @unchecked Sendable {
     private let state: String
     private let queue = DispatchQueue(label: "thirdhand.codex-callback")
     private var listener: NWListener?
-    private var result: Result<String, Error>?
-    private var waiter: CheckedContinuation<String, Error>?
+    private var result: Result<OAuthCallback, Error>?
+    private var waiter: CheckedContinuation<OAuthCallback, Error>?
     private var starting: CheckedContinuation<Void, Error>?
 
     init(state: String) { self.state = state }
@@ -221,7 +367,7 @@ final class CodexCallbackServer: @unchecked Sendable {
         }
     }
 
-    func code() async throws -> String {
+    func callback() async throws -> OAuthCallback {
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
                 queue.async {
@@ -234,7 +380,7 @@ final class CodexCallbackServer: @unchecked Sendable {
         }
     }
 
-    private func finish(_ outcome: Result<String, Error>) {
+    private func finish(_ outcome: Result<OAuthCallback, Error>) {
         guard result == nil else { return }
         result = outcome
         waiter?.resume(with: outcome)
@@ -255,7 +401,7 @@ final class CodexCallbackServer: @unchecked Sendable {
     }
 
     /// Returns the HTTP status, page text, and sign-in outcome (nil for unrelated requests).
-    static func evaluate(request: String, state: String) -> (String, String, Result<String, Error>?) {
+    static func evaluate(request: String, state: String) -> (String, String, Result<OAuthCallback, Error>?) {
         let target = request.split(separator: "\r\n").first?.split(separator: " ").dropFirst().first.map(String.init) ?? ""
         guard let components = URLComponents(string: "http://localhost" + target), components.path == "/auth/callback" else {
             return ("404 Not Found", "Not found.", nil)
@@ -273,6 +419,6 @@ final class CodexCallbackServer: @unchecked Sendable {
             return ("400 Bad Request", "Sign-in failed. Start again from Third Hand.",
                     .failure(CodexAuthError(message: "ChatGPT did not return an authorization code.")))
         }
-        return ("200 OK", "Signed in to Third Hand. You can close this tab.", .success(code))
+        return ("200 OK", "Signed in to Third Hand. You can close this tab.", .success(OAuthCallback(code: code, clientID: items["client_id"].flatMap { $0.isEmpty ? nil : $0 })))
     }
 }

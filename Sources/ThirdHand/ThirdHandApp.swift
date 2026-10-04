@@ -6,10 +6,12 @@ struct ThirdHandApp: App {
 
     var body: some Scene {
         // The chat window is managed by AppDelegate so the Dock icon and Control–Space can always reopen it.
-        Settings {
-            SetupView(delegate: appDelegate)
-        }
+        Settings { EmptyView() }
         .commands {
+            CommandGroup(replacing: .appSettings) {
+                Button("Settings…") { appDelegate.showSetup() }
+                    .keyboardShortcut(",")
+            }
             CommandGroup(replacing: .newItem) {
                 Button("New Thread") {
                     appDelegate.chat.newThread()

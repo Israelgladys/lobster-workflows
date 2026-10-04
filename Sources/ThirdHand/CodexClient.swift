@@ -33,11 +33,11 @@ struct CodexResponse {
     }
 }
 
-/// ChatGPT-authenticated Responses API on the Codex backend.
+/// Responses API billed to the user's ChatGPT plan through Sign in with ChatGPT.
 @MainActor
 final class CodexClient {
-    nonisolated static let endpoint = URL(string: "https://chatgpt.com/backend-api/codex/responses")!
-    nonisolated static let originator = "third_hand"
+    nonisolated static let endpoint = URL(string: "https://api.openai.com/v1/responses")!
+    nonisolated static let modelsEndpoint = URL(string: "https://api.openai.com/v1/models")!
     nonisolated static let strongModel = "gpt-6-sol"
     /// A fixed model from `defaults write com.thirdhand.app CodexModel <model>` pins the planner model and disables escalation.
     nonisolated static var modelOverride: String? { UserDefaults.standard.string(forKey: "CodexModel") }
@@ -83,10 +83,8 @@ final class CodexClient {
         var request = URLRequest(url: Self.endpoint, timeoutInterval: 120)
         request.httpMethod = "POST"
         request.setValue("Bearer \(tokens.access)", forHTTPHeaderField: "Authorization")
-        request.setValue(tokens.accountId, forHTTPHeaderField: "ChatGPT-Account-Id")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
-        request.setValue(Self.originator, forHTTPHeaderField: "originator")
         request.httpBody = try JSONSerialization.data(withJSONObject: Self.requestBody(
             model: model, instructions: instructions, input: input, tools: tools, effort: effort))
         Log.info("Codex request model=\(model) effort=\(effort) bytes=\(request.httpBody?.count ?? 0) items=\(input.count)")
@@ -168,8 +166,10 @@ final class CodexClient {
                 let response = event["response"] as? [String: Any]
                 let error = (response?["error"] as? [String: Any]) ?? (event["error"] as? [String: Any])
                 let detail = (error?["message"] as? String) ?? (event["message"] as? String)
-                Log.info("Codex stream error type=\(event["type"] as? String ?? "") detail=\(String((detail ?? "").prefix(300)))")
-                throw CodexServiceError(status: 502, message: "ChatGPT could not complete this step. No further input was sent.")
+                let code = error?["code"] as? String
+                Log.info("Codex stream error type=\(event["type"] as? String ?? "") code=\(code ?? "") detail=\(String((detail ?? "").prefix(300)))")
+                throw CodexServiceError(status: 502, message: planMessage(code: code, param: error?["param"] as? String)
+                                        ?? "ChatGPT could not complete this step. No further input was sent.")
             default: break
             }
         }
@@ -182,14 +182,50 @@ final class CodexClient {
 
     nonisolated static func serviceError(status: Int, body: Data) -> CodexServiceError {
         let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any]
-        let detail = ((json?["error"] as? [String: Any])?["message"] as? String) ?? (json?["detail"] as? String) ?? ""
-        Log.info("Codex error HTTP \(status) detail=\(String(detail.prefix(300)).replacingOccurrences(of: "\n", with: " "))")
+        let error = json?["error"] as? [String: Any]
+        // Pre-stream admission failures may arrive as {"detail": "..."}; that text is diagnostic only.
+        let detail = (error?["message"] as? String) ?? (json?["detail"] as? String) ?? ""
+        let code = error?["code"] as? String
+        Log.info("Codex error HTTP \(status) code=\(code ?? "") param=\(error?["param"] as? String ?? "") detail=\(String(detail.prefix(300)).replacingOccurrences(of: "\n", with: " "))")
+        if let message = planMessage(code: code, param: error?["param"] as? String) {
+            return CodexServiceError(status: status, message: message)
+        }
         let messages = [401: "ChatGPT session expired. Sign in again in Third Hand setup.",
-                        403: "Your ChatGPT account cannot use this model or endpoint.",
-                        429: "ChatGPT usage limit reached. Wait for your allowance to reset."]
+                        403: "Your ChatGPT account cannot use this model for third-party apps.",
+                        429: "ChatGPT usage limit reached. Check ChatGPT Settings → Usage.",
+                        503: "ChatGPT plan usage is temporarily unavailable. Try again shortly."]
         let fallback = detail.isEmpty
-            ? "ChatGPT returned \(status). The Codex endpoint or model access may have changed."
+            ? "ChatGPT returned \(status). Model access for Third Hand may have changed."
             : "ChatGPT returned \(status): \(detail.prefix(200))"
         return CodexServiceError(status: status, message: messages[status] ?? fallback)
+    }
+
+    /// Messages for Sign in with ChatGPT plan-usage error codes.
+    nonisolated static func planMessage(code: String?, param: String?) -> String? {
+        switch code {
+        case "subscription_sharing_user_not_eligible":
+            return "This ChatGPT account or workspace can't use its plan in third-party apps."
+        case "subscription_sharing_usage_limit_exceeded":
+            return "Third Hand reached its ChatGPT usage limit. Raise it or wait in ChatGPT Settings → Usage."
+        case "subscription_sharing_unsupported_capability":
+            return "ChatGPT plan usage doesn't support a request feature" + (param.map { " (\($0))" } ?? "") + "."
+        case "subscription_sharing_invalid_user":
+            return "ChatGPT session expired. Sign in again in Third Hand setup."
+        default: return nil
+        }
+    }
+
+    /// Model slugs this account can use through its plan.
+    func availableModels() async throws -> [String] {
+        let tokens = try await credentials.current()
+        var request = URLRequest(url: Self.modelsEndpoint, timeoutInterval: 20)
+        request.setValue("Bearer \(tokens.access)", forHTTPHeaderField: "Authorization")
+        let (data, response) = try await session.data(for: request)
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        guard status == 200 else { throw Self.serviceError(status: status, body: data) }
+        let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        let models = (json?["models"] as? [[String: Any]]) ?? (json?["data"] as? [[String: Any]]) ?? []
+        return models.filter { ($0["visibility"] as? String ?? "list") == "list" }
+            .compactMap { ($0["slug"] as? String) ?? ($0["id"] as? String) }
     }
 }

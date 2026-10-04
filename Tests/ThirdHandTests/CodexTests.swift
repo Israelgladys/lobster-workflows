@@ -7,14 +7,36 @@ private func jwt(_ claims: [String: Any]) -> String {
     return "e30." + CodexAuth.base64URL(payload) + ".sig"
 }
 
-private func tokenResponse(account: String = "acct_1", subject: String = "user_1", refresh: String? = "refresh_2") -> [String: Any] {
+/// A throwaway RSA key standing in for OpenAI's signing key.
+private let signingKey: SecKey = {
+    let attributes: [String: Any] = [kSecAttrKeyType as String: kSecAttrKeyTypeRSA, kSecAttrKeySizeInBits as String: 2048]
+    return SecKeyCreateRandomKey(attributes as CFDictionary, nil)!
+}()
+private let testKeys: IDToken.KeyProvider = { _ in SecKeyCopyPublicKey(signingKey)! }
+
+private func signedJWT(_ claims: [String: Any], key: SecKey = signingKey) -> String {
+    let header = CodexAuth.base64URL(try! JSONSerialization.data(withJSONObject: ["alg": "RS256", "kid": "k1"]))
+    let input = header + "." + CodexAuth.base64URL(try! JSONSerialization.data(withJSONObject: claims))
+    let signature = SecKeyCreateSignature(key, .rsaSignatureMessagePKCS1v15SHA256, Data(input.utf8) as CFData, nil)! as Data
+    return input + "." + CodexAuth.base64URL(signature)
+}
+
+private func idClaims(subject: String = "user_1", nonce: String? = "n1", audience: String = "client_1") -> [String: Any] {
+    var claims: [String: Any] = ["iss": "https://auth.openai.com", "aud": audience, "sub": subject, "email": "a@example.com",
+                                 "exp": Date().addingTimeInterval(3600).timeIntervalSince1970]
+    if let nonce { claims["nonce"] = nonce }
+    return claims
+}
+
+private func tokenResponse(subject: String = "user_1", refresh: String? = "refresh_2", nonce: String? = "n1",
+                           scope: String? = CodexAuth.scope) -> [String: Any] {
     var raw: [String: Any] = [
         "access_token": jwt(["sub": subject]),
-        "id_token": jwt(["sub": subject, "email": "a@example.com",
-                         "https://api.openai.com/auth": ["chatgpt_account_id": account]]),
+        "id_token": signedJWT(idClaims(subject: subject, nonce: nonce)),
         "expires_in": 3600.0
     ]
     if let refresh { raw["refresh_token"] = refresh }
+    if let scope { raw["scope"] = scope }
     return raw
 }
 
@@ -64,48 +86,94 @@ private func sse(_ events: [[String: Any]]) -> Data {
 }
 
 private let fixtureTokens = CodexTokens(access: "access_1", refresh: "refresh_1", expires: Date().addingTimeInterval(3600),
-                                        accountId: "acct_1", subject: "user_1", email: nil)
+                                        clientID: "client_1", subject: "user_1", email: nil)
 
 @MainActor
 final class CodexAuthTests: XCTestCase {
-    func testPKCEChallengeIsSHA256OfVerifierAndURLIdentifiesThirdHand() throws {
+    func testAuthorizeURLFollowsOfficialRegistrationFlow() throws {
         let pkce = CodexAuth.makePKCE()
         XCTAssertEqual(pkce.verifier.count, 43)
         XCTAssertEqual(pkce.challenge, CodexAuth.base64URL(Data(SHA256.hash(data: Data(pkce.verifier.utf8)))))
-        let url = CodexAuth.authorizeURL(pkce: pkce, state: "state_1")
+        let url = CodexAuth.authorizeURL(pkce: pkce, state: "state_1", nonce: "n1", clientID: nil, hostID: "urn:uuid:h1")
         let items = Dictionary(uniqueKeysWithValues: URLComponents(url: url, resolvingAgainstBaseURL: false)!.queryItems!.map { ($0.name, $0.value!) })
-        XCTAssertEqual(url.host, "auth.openai.com")
-        XCTAssertEqual(items["client_id"], CodexAuth.clientID)
-        XCTAssertEqual(items["redirect_uri"], "http://localhost:1455/auth/callback")
+        XCTAssertEqual(url.absoluteString.components(separatedBy: "?")[0], "https://auth.openai.com/api/accounts/authorize")
+        XCTAssertEqual(items["client_id"], "dynamic_agent_client", "First sign-in registers dynamically")
+        XCTAssertEqual(items["agent_name_hint"], "Third Hand")
+        XCTAssertEqual(items["ext_agent_host_id"], "urn:uuid:h1")
+        XCTAssertEqual(items["redirect_uri"], "http://127.0.0.1:1455/auth/callback")
+        XCTAssertEqual(items["scope"], "openid profile email offline_access resource.invoke chatgpt.tokens.use.direct")
+        XCTAssertEqual(items["resource"], "https://api.openai.com/v1")
         XCTAssertEqual(items["code_challenge_method"], "S256")
-        XCTAssertEqual(items["scope"], "openid profile email offline_access")
         XCTAssertEqual(items["state"], "state_1")
-        XCTAssertEqual(items["originator"], "third_hand")
+        XCTAssertEqual(items["nonce"], "n1")
+        XCTAssertNil(items["id_token_hint"])
+        let again = CodexAuth.authorizeURL(pkce: pkce, state: "s", nonce: "n", clientID: "client_1", hostID: "urn:uuid:h1", idTokenHint: "hint")
+        let later = Dictionary(uniqueKeysWithValues: URLComponents(url: again, resolvingAgainstBaseURL: false)!.queryItems!.map { ($0.name, $0.value!) })
+        XCTAssertEqual(later["client_id"], "client_1", "Later sign-ins reuse the issued client ID")
+        XCTAssertEqual(later["id_token_hint"], "hint")
     }
 
-    func testTokensKeepAccountAndRejectAccountSwitchOnRefresh() throws {
-        let first = try CodexAuth.normalize(tokenResponse())
-        XCTAssertEqual(first.accountId, "acct_1")
+    func testIDTokenMustBeSignedForThisClientAndNonce() async throws {
+        let claims = try await IDToken.verify(signedJWT(idClaims()), clientID: "client_1", nonce: "n1", keys: testKeys)
+        XCTAssertEqual(claims["sub"] as? String, "user_1")
+        let other = SecKeyCreateRandomKey([kSecAttrKeyType as String: kSecAttrKeyTypeRSA, kSecAttrKeySizeInBits as String: 2048] as CFDictionary, nil)!
+        for (token, nonce) in [(signedJWT(idClaims(), key: other), "n1"),                  // forged signature
+                               (signedJWT(idClaims(audience: "someone_else")), "n1"),   // wrong audience
+                               (signedJWT(idClaims()), "n2"),                           // replayed nonce
+                               (jwt(idClaims()), "n1")] {                               // unsigned
+            do { _ = try await IDToken.verify(token, clientID: "client_1", nonce: nonce, keys: testKeys); XCTFail("Accepted a bad ID token") }
+            catch {}
+        }
+    }
+
+    func testJWKBecomesVerifyingKey() throws {
+        // PKCS#1 RSAPublicKey: SEQUENCE { INTEGER n, INTEGER e }.
+        let der = [UInt8](SecKeyCopyExternalRepresentation(SecKeyCopyPublicKey(signingKey)!, nil)! as Data)
+        var index = 1
+        func length() -> Int {
+            let first = Int(der[index]); index += 1
+            guard first & 0x80 != 0 else { return first }
+            var value = 0
+            for _ in 0..<(first & 0x7f) { value = value << 8 | Int(der[index]); index += 1 }
+            return value
+        }
+        _ = length()
+        func integer() -> Data { index += 1; let count = length(); defer { index += count }; return Data(der[index..<index + count]) }
+        let (n, e) = (integer(), integer())
+        let key = try XCTUnwrap(IDToken.rsaKey(["kty": "RSA", "n": CodexAuth.base64URL(n), "e": CodexAuth.base64URL(e)]))
+        let message = Data("hello".utf8)
+        let signature = SecKeyCreateSignature(signingKey, .rsaSignatureMessagePKCS1v15SHA256, message as CFData, nil)! as Data
+        XCTAssertTrue(SecKeyVerifySignature(key, .rsaSignatureMessagePKCS1v15SHA256, message as CFData, signature as CFData, nil))
+    }
+
+    func testTokensRequirePlanScopeAndRejectAccountSwitchOnRefresh() throws {
+        let identity = idClaims()
+        let first = try CodexAuth.normalize(tokenResponse(), identity: identity, clientID: "client_1")
+        XCTAssertEqual(first.clientID, "client_1")
         XCTAssertEqual(first.subject, "user_1")
         XCTAssertEqual(first.email, "a@example.com")
-        let refreshed = try CodexAuth.normalize(tokenResponse(refresh: nil), previous: first)
+        XCTAssertNotNil(first.idToken)
+        let refreshed = try CodexAuth.normalize(tokenResponse(refresh: nil, scope: nil), identity: [:], clientID: "client_1", previous: first)
         XCTAssertEqual(refreshed.refresh, "refresh_2", "A refresh without a new token keeps the previous one")
-        XCTAssertThrowsError(try CodexAuth.normalize(tokenResponse(account: "acct_2"), previous: first))
-        XCTAssertThrowsError(try CodexAuth.normalize(tokenResponse(subject: "user_2"), previous: first))
-        XCTAssertThrowsError(try CodexAuth.normalize(["access_token": "opaque"]))
+        XCTAssertThrowsError(try CodexAuth.normalize(tokenResponse(), identity: idClaims(subject: "user_2"), clientID: "client_1", previous: first))
+        XCTAssertThrowsError(try CodexAuth.normalize(tokenResponse(scope: "openid profile email offline_access"), identity: identity, clientID: "client_1"),
+                             "Sign-in without plan usage is rejected")
+        XCTAssertThrowsError(try CodexAuth.normalize(["access_token": "opaque", "scope": CodexAuth.scope], identity: [:], clientID: "client_1"))
     }
 
-    func testTokenRequestIsFormEncodedWithClientID() {
+    func testTokenRequestIsFormEncoded() {
         let request = CodexAuth.tokenRequest(["grant_type": "refresh_token", "refresh_token": "a+b/c="])
+        XCTAssertEqual(request.url?.absoluteString, "https://auth.openai.com/api/accounts/oauth/token")
         let form = String(decoding: request.httpBody!, as: UTF8.self)
-        XCTAssertTrue(form.contains("client_id=\(CodexAuth.clientID)"))
         XCTAssertTrue(form.contains("refresh_token=a%2Bb/c%3D") || form.contains("refresh_token=a%2Bb%2Fc%3D"))
         XCTAssertEqual(request.value(forHTTPHeaderField: "Content-Type"), "application/x-www-form-urlencoded")
     }
 
     func testCallbackRequiresMatchingState() {
         let ok = CodexCallbackServer.evaluate(request: "GET /auth/callback?code=abc&state=s1 HTTP/1.1\r\nHost: localhost\r\n\r\n", state: "s1")
-        XCTAssertEqual(try ok.2?.get(), "abc")
+        XCTAssertEqual(try ok.2?.get(), OAuthCallback(code: "abc", clientID: nil))
+        let registered = CodexCallbackServer.evaluate(request: "GET /auth/callback?code=abc&state=s1&client_id=client_9 HTTP/1.1\r\n\r\n", state: "s1")
+        XCTAssertEqual(try registered.2?.get().clientID, "client_9", "A new registration returns the issued client ID")
         let forged = CodexCallbackServer.evaluate(request: "GET /auth/callback?code=abc&state=other HTTP/1.1\r\n\r\n", state: "s1")
         XCTAssertThrowsError(try forged.2!.get())
         let denied = CodexCallbackServer.evaluate(request: "GET /auth/callback?error=access_denied&state=s1 HTTP/1.1\r\n\r\n", state: "s1")
@@ -121,16 +189,16 @@ final class CodexAuthTests: XCTestCase {
         XCTAssertEqual((favicon as? HTTPURLResponse)?.statusCode, 404)
         let (_, response) = try await URLSession.shared.data(from: URL(string: "http://localhost:1455/auth/callback?code=abc&state=s1")!)
         XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 200)
-        let code = try await server.code()
-        XCTAssertEqual(code, "abc")
+        let callback = try await server.callback()
+        XCTAssertEqual(callback.code, "abc")
     }
 
     func testConcurrentRequestsShareOneRefresh() async throws {
-        let session = StubProtocol.session { _ in (200, try! JSONSerialization.data(withJSONObject: tokenResponse())) }
+        let session = StubProtocol.session { _ in (200, try! JSONSerialization.data(withJSONObject: tokenResponse(nonce: nil))) }
         var expired = fixtureTokens
         expired.expires = Date().addingTimeInterval(-10)
         let saved = SavedTokens()
-        let credentials = CodexCredentials(tokens: expired, session: session, persist: { saved.value = $0 })
+        let credentials = CodexCredentials(tokens: expired, session: session, persist: { saved.value = $0 }, keys: testKeys)
         async let a = credentials.current()
         async let b = credentials.current()
         let (first, second) = try await (a, b)
@@ -140,6 +208,20 @@ final class CodexAuthTests: XCTestCase {
         let form = String(decoding: StubProtocol.requests[0].httpBody!, as: UTF8.self)
         XCTAssertTrue(form.contains("grant_type=refresh_token"))
         XCTAssertTrue(form.contains("refresh_token=refresh_1"))
+        XCTAssertTrue(form.contains("client_id=client_1"))
+        XCTAssertTrue(form.contains("resource=https"))
+    }
+
+    func testRevokedRefreshTokenIsForgotten() async throws {
+        let session = StubProtocol.session { _ in (400, Data(#"{"error":"refresh_token_reused"}"#.utf8)) }
+        var expired = fixtureTokens
+        expired.expires = Date().addingTimeInterval(-10)
+        let forgotten = SavedTokens()
+        let credentials = CodexCredentials(tokens: expired, session: session, persist: { _ in },
+                                           forget: { forgotten.value = expired }, keys: testKeys)
+        do { _ = try await credentials.current(); XCTFail("Expected a refresh failure") }
+        catch let error as CodexRefreshError { XCTAssertTrue(error.terminal) }
+        XCTAssertNotNil(forgotten.value)
     }
 }
 
@@ -165,8 +247,7 @@ final class CodexClientTests: XCTestCase {
         let request = StubProtocol.requests[0]
         XCTAssertEqual(request.url, CodexClient.endpoint)
         XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer access_1")
-        XCTAssertEqual(request.value(forHTTPHeaderField: "ChatGPT-Account-Id"), "acct_1")
-        XCTAssertEqual(request.value(forHTTPHeaderField: "originator"), "third_hand")
+        XCTAssertEqual(request.url?.absoluteString, "https://api.openai.com/v1/responses")
         XCTAssertFalse((request.value(forHTTPHeaderField: "User-Agent") ?? "").contains("opencode"))
         let json = try JSONSerialization.jsonObject(with: request.httpBody!) as! [String: Any]
         XCTAssertEqual(json["model"] as? String, "gpt-test")
@@ -194,6 +275,27 @@ final class CodexClientTests: XCTestCase {
             XCTAssertEqual(error.status, 401)
             XCTAssertTrue(error.message.contains("Sign in again"))
         }
+    }
+
+    func testPlanUsageErrorsExplainWhatToDo() async throws {
+        let limited = StubProtocol.session { _ in (429, Data(#"{"error":{"code":"subscription_sharing_usage_limit_exceeded","message":"cap"}}"#.utf8)) }
+        do {
+            _ = try await CodexClient(credentials: CodexCredentials(tokens: fixtureTokens), session: limited)
+                .respond(model: "gpt-test", instructions: "x", input: [], tools: [])
+            XCTFail("Expected a limit error")
+        } catch let error as CodexServiceError { XCTAssertTrue(error.message.contains("Settings → Usage")) }
+        let failed = sse([["type": "response.failed", "response": ["error": ["code": "subscription_sharing_user_not_eligible"]]]])
+        XCTAssertThrowsError(try CodexClient.collect(failed.split(separator: UInt8(ascii: "\n")).compactMap {
+            CodexClient.event(fromLine: String(decoding: $0, as: UTF8.self)) })) {
+            XCTAssertTrue(($0 as? CodexServiceError)?.message.contains("third-party apps") == true)
+        }
+    }
+
+    func testModelListKeepsListedSlugs() async throws {
+        let session = StubProtocol.session { _ in (200, Data(#"{"models":[{"slug":"gpt-6.1-sol","visibility":"list"},{"slug":"hidden","visibility":"hide"}]}"#.utf8)) }
+        let models = try await CodexClient(credentials: CodexCredentials(tokens: fixtureTokens), session: session).availableModels()
+        XCTAssertEqual(models, ["gpt-6.1-sol"])
+        XCTAssertEqual(StubProtocol.requests[0].url?.absoluteString, "https://api.openai.com/v1/models")
     }
 
     func testSSELineParsingIgnoresNonDataLines() {
