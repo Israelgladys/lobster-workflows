@@ -8,9 +8,12 @@ import Foundation
 final class ArcDriver: @unchecked Sendable {
     /// On unless `defaults write com.thirdhand.app ArcDriver -bool NO`.
     static var enabled: Bool { UserDefaults.standard.object(forKey: "ArcDriver") as? Bool ?? true }
-    static let defaultPackage = "arc-cua[macos] @ git+https://github.com/shhivv/arc-cua@7a766a1"
+    static let defaultPackage = "arc-cua[macos] @ git+https://github.com/shhivv/arc-cua@4f313bd"
     /// `defaults write com.thirdhand.app ArcPackage "arc-cua[macos] @ file:///path/to/arc-cua"` runs a local checkout.
     static var package: String { UserDefaults.standard.string(forKey: "ArcPackage") ?? defaultPackage }
+    /// Off with `defaults write com.thirdhand.app ArcSettle -bool NO`: input returns at once and the screen is
+    /// watched instead (needed for arc-cua versions before settling).
+    static var settles: Bool { UserDefaults.standard.object(forKey: "ArcSettle") as? Bool ?? true }
     static let logPath = NSHomeDirectory() + "/Library/Logs/Third Hand arc-cua.log"
 
     static let shared = ArcDriver()
@@ -203,10 +206,16 @@ final class ArcDriver: @unchecked Sendable {
     }
 
     /// Calls an input tool; throws `Changed` when the app changed under the snapshot and nothing was done.
-    func input(_ tool: String, _ arguments: [String: Any]) async throws {
+    /// With `settle`, arc waits until the app has finished reacting and the result carries a fresh
+    /// snapshot (`fresh`) and `settled: {reacted, timed_out, elapsed_ms}`.
+    @discardableResult
+    func input(_ tool: String, _ arguments: [String: Any], settle: Bool = false) async throws -> [String: Any] {
+        var arguments = arguments
+        if settle { arguments["settle"] = true }
         let result = try await call(tool, arguments)
         let status = result["status"] as? String ?? "done"
         guard status == "done" else { throw Changed(status: status) }
+        return result
     }
 
     // MARK: - Mapping

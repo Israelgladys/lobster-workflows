@@ -47,6 +47,8 @@ final class TaskRunner: ActionLayer {
     /// arc-cua's driver for background control without a debugging connection, and the window it reads.
     private var arc: ArcDriver?
     private var arcWindow: Int?
+    /// The result of the last input arc-cua settled on: a fresh snapshot and whether the app reacted.
+    private var arcSettled: [String: Any]?
     private lazy var jev = JevClient(apiKey: apiKey)
 
     init(target: AppTarget, goal: String, apiKey: String, credentials: CodexCredentials, context: [String] = [],
@@ -676,6 +678,12 @@ final class TaskRunner: ActionLayer {
             }
         }
         guard let result else { throw ControllerError.invalid("\(target.name) has no window Third Hand can reach.") }
+        return try await observation(from: result, arc: arc)
+    }
+
+    /// An observation of an arc-cua snapshot (from `observe`, or the fresh one an input settled on),
+    /// with OCR text added when recovery turned it on.
+    private func observation(from result: [String: Any], arc: ArcDriver) async throws -> Observation {
         let snapshot = ArcDriver.snapshot(result)
         arcWindow = snapshot.windowID
         var elements = snapshot.elements
@@ -697,7 +705,27 @@ final class TaskRunner: ActionLayer {
         return Observation(elements: elements, windowID: CGWindowID(snapshot.windowID), frame: .zero, snapshot: snapshot.id)
     }
 
+    /// arc-cua settles: it waits until the app has finished reacting (its accessibility notifications go quiet)
+    /// and returns a fresh snapshot. Some apps go quiet before the result shows (Spotify reports typed text
+    /// over a second later), so an action that doesn't verify falls back to watching the screen.
+    private func settle(with arc: ArcDriver, after decision: AgentDecision, before: Observation) async throws -> Observation {
+        // Input settles as part of the call; a wait step has no input, so it settles here.
+        var result = arcSettled?["fresh"] as? [String: Any]
+        if result == nil, let snapshot = before.snapshot {
+            let settled = try await arc.call("settle", ["snapshot": snapshot])
+            if settled["window_gone"] as? Bool != true { result = settled }
+        }
+        let report = (result?["settled"] ?? arcSettled?["settled"]) as? [String: Any]
+        let latest: Observation
+        if let result { latest = try await observation(from: result, arc: arc) } else { latest = try await observe() }
+        let verified = ObservationState.verify(decision, before: before.elements, after: latest.elements).verified
+        Log.info("Settle via=arc reacted=\(report?["reacted"] ?? "?") ms=\(report?["elapsed_ms"] ?? "?") verified=\(verified)")
+        guard !verified, decision.operation != "WAIT" else { return latest }
+        return try await pollUntilSettled(after: decision, before: before)
+    }
+
     private func settle(after decision: AgentDecision, before: Observation) async throws -> Observation {
+        if let arc, ArcDriver.settles { return try await settle(with: arc, after: decision, before: before) }
         // A page can say when it stops changing, instead of polling the screen for a second or more.
         if let cdp = cdpClient, background || cdp.isConnected {
             do {
@@ -714,6 +742,12 @@ final class TaskRunner: ActionLayer {
             } catch is CancellationError { throw CancellationError() }
             catch { if background { throw error } }
         }
+        return try await pollUntilSettled(after: decision, before: before)
+    }
+
+    /// Re-reads the window until it stops changing and the action verifies, for at least a second and at
+    /// most 2.5 seconds; the screen itself is the only signal.
+    private func pollUntilSettled(after decision: AgentDecision, before: Observation) async throws -> Observation {
         let clock = ContinuousClock()
         let start = clock.now
         let deadline = start.advanced(by: .seconds(2.5))
@@ -851,19 +885,24 @@ final class TaskRunner: ActionLayer {
     }
 
     /// Input through arc-cua, checked against `snapshot` when it runs. Throws `ArcDriver.Changed` when the app
-    /// changed under the snapshot and nothing was done.
+    /// changed under the snapshot and nothing was done. The step's last input settles, leaving `arcSettled`.
     private func executeWithArc(_ arc: ArcDriver, _ decision: AgentDecision, elements: [AccessibilityElement],
                                 windowID: CGWindowID, snapshot: String?) async throws {
+        arcSettled = nil
         guard let snapshot else { throw ControllerError.invalid("No current reading of \(target.name) to act on.") }
         let element = elements.first { String($0.id) == decision.targetIndex }
         let pid = Int(target.pid), window = Int(windowID)
+        func send(_ tool: String, _ arguments: [String: Any], settle: Bool = ArcDriver.settles) async throws {
+            let result = try await arc.input(tool, arguments, settle: settle)
+            if settle { arcSettled = result }
+        }
         func act(_ action: String, _ extra: [String: Any] = [:]) async throws {
             guard let id = element?.driverID else { throw ControllerError.invalid("No control was selected.") }
-            try await arc.input("act", ["snapshot": snapshot, "action": action, "element": id].merging(extra) { $1 })
+            try await send("act", ["snapshot": snapshot, "action": action, "element": id].merging(extra) { $1 })
         }
-        func press(_ key: String, _ modifiers: [String] = []) async throws {
+        func press(_ key: String, _ modifiers: [String] = [], settle: Bool = true) async throws {
             guard let keys = ArcDriver.chord(key: key, modifiers: modifiers) else { throw ControllerError.invalid("Unsupported key") }
-            try await arc.input("press", ["pid": pid, "window_id": window, "keys": keys, "snapshot": snapshot])
+            try await send("press", ["pid": pid, "window_id": window, "keys": keys, "snapshot": snapshot], settle: settle)
         }
         try checkFocus()
         switch decision.operation {
@@ -873,14 +912,14 @@ final class TaskRunner: ActionLayer {
         case "CLICK_TEXT":
             // OCR text has a frame in window points and no element to name.
             guard let frame = element?.frame else { throw ControllerError.invalid("The selected text has no position.") }
-            try await arc.input("click_at", ["pid": pid, "window_id": window, "x": frame.midX, "y": frame.midY, "snapshot": snapshot])
+            try await send("click_at", ["pid": pid, "window_id": window, "x": frame.midX, "y": frame.midY, "snapshot": snapshot])
         case "TYPE_TEXT":
             guard let text = decision.textValue else { throw ControllerError.invalid("Missing text") }
             if target.isTerminal {
                 // Readline-style editing for a shell prompt, typed where the terminal has key focus.
-                try await press("a", ["control"])
-                try await press("k", ["control"])
-                try await arc.input("type_text", ["pid": pid, "window_id": window, "text": text])
+                try await press("a", ["control"], settle: false)
+                try await press("k", ["control"], settle: false)
+                try await send("type_text", ["pid": pid, "window_id": window, "text": text])
                 terminalInputPending = true
             } else {
                 try await act("TYPE_TEXT", ["value": text])
@@ -896,8 +935,8 @@ final class TaskRunner: ActionLayer {
                 let windows = try await arc.call("windows", ["pid": pid])["windows"] as? [[String: Any]] ?? []
                 let bounds = windows.first { $0["window_id"] as? Int == window }?["bounds"] as? [String: Any]
                 let width = bounds?["width"] as? Double ?? 400, height = bounds?["height"] as? Double ?? 400
-                try await arc.input("scroll_at", ["pid": pid, "window_id": window, "x": width / 2, "y": height / 2,
-                                                  "dy": up ? 300 : -300, "snapshot": snapshot])
+                try await send("scroll_at", ["pid": pid, "window_id": window, "x": width / 2, "y": height / 2,
+                                             "dy": up ? 300 : -300, "snapshot": snapshot])
             }
         case "WAIT": try await Task.sleep(nanoseconds: 700_000_000)
         default: throw ControllerError.invalid("Unsupported operation")
