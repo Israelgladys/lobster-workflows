@@ -19,7 +19,8 @@ final class ArcDriverTests: XCTestCase {
         XCTAssertEqual(snapshot.id, "s3")
         XCTAssertEqual(snapshot.windowID, 18342)
         XCTAssertEqual(snapshot.elements.map(\.id), [1, 2, 3, 4, 5])
-        XCTAssertEqual(snapshot.elements.map(\.driverID), ["ax_1", "ax_2", "ax_3", "ax_4", "ax_5"])
+        XCTAssertEqual(snapshot.elements.map(\.driverID), ["18342/ax_1", "18342/ax_2", "18342/ax_3", "18342/ax_4", "18342/ax_5"])
+        XCTAssertEqual(snapshot.elements[3].driverElementID, "ax_4")
         let search = snapshot.elements[0]
         XCTAssertEqual(search.role, "AXTextField")
         XCTAssertEqual(search.label, "Search")
@@ -54,8 +55,48 @@ final class ArcDriverTests: XCTestCase {
         let before = ArcDriver.snapshot(observed).elements
         var pause = AccessibilityElement(id: 4, role: "AXButton", label: "Pause", value: nil, enabled: true,
                                          actions: ["CLICK"], axElement: nil)
-        pause.driverID = "ax_4"
+        pause.driverID = "18342/ax_4"
         XCTAssertEqual(ObservationState.matching(before[3], in: [before[2], pause])?.label, "Pause")
+    }
+
+    private func button(_ driverID: String, _ label: String) -> AccessibilityElement {
+        var element = AccessibilityElement(id: 1, role: "AXButton", label: label, value: nil, enabled: true,
+                                           actions: ["CLICK"], axElement: nil)
+        element.driverID = driverID
+        return element
+    }
+
+    func testArcIDsDontMatchAcrossWindows() {
+        // Each window numbers its elements from ax_1, so the same id in another window is another element.
+        let play = button("18342/ax_4", "Play")
+        XCTAssertNil(ObservationState.matching(play, in: [button("20000/ax_4", "Delete"), button("20000/ax_5", "Cancel")]))
+    }
+
+    func testRebuiltElementMatchesByLabel() {
+        // An app that rebuilds its tree gives the same button a new id.
+        let play = button("18342/ax_4", "Play")
+        XCTAssertEqual(ObservationState.matching(play, in: [button("18342/ax_40", "Play"), button("18342/ax_41", "Next")])?.driverID,
+                       "18342/ax_40")
+    }
+
+    func testTerminalTextAreaTakesTyping() {
+        let result: [String: Any] = ["snapshot": "s1", "window_id": 7, "elements": [
+            ["id": "ax_1", "role": "TextArea", "value": "$ ", "actions": ["CLICK"]]] as [[String: Any]]]
+        XCTAssertEqual(ArcDriver.snapshot(result, terminal: true).elements[0].actions, ["CLICK", "TYPE_TEXT"])
+        XCTAssertEqual(ArcDriver.snapshot(result).elements[0].actions, ["CLICK"])
+    }
+
+    func testRetractedActionCanBeRetried() {
+        // arc refused the input because the app changed, so nothing was sent; the retry isn't a repeat.
+        var progress = RunProgress()
+        let elements = ArcDriver.snapshot(observed).elements
+        let click = AgentDecision(operation: "CLICK", targetIndex: "4")
+        XCTAssertNil(progress.problem(decision: click, elements: elements))
+        XCTAssertNotNil(progress.problem(decision: click, elements: elements))
+        var retracted = RunProgress()
+        XCTAssertNil(retracted.problem(decision: click, elements: elements))
+        retracted.retract()
+        XCTAssertNil(retracted.problem(decision: click, elements: elements))
     }
 
     func testChords() {

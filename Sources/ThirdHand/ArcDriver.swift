@@ -62,6 +62,23 @@ final class ArcDriver: @unchecked Sendable {
             .first { FileManager.default.isExecutableFile(atPath: $0) }
     }
 
+    /// The server to run: `uvx` with the pinned package, or nil when uv isn't installed.
+    nonisolated static func defaultCommand() -> (executable: URL, arguments: [String])? {
+        uvx().map { (URL(fileURLWithPath: $0), ["--from", package, "arc-cua", "mcp"]) }
+    }
+
+    private let command: () -> (executable: URL, arguments: [String])?
+    private let startTimeout: TimeInterval
+    private let callTimeout: TimeInterval
+
+    /// Tests pass a fake server and short timeouts.
+    init(command: @escaping () -> (executable: URL, arguments: [String])? = ArcDriver.defaultCommand,
+         startTimeout: TimeInterval = 120, callTimeout: TimeInterval = 60) {
+        self.command = command
+        self.startTimeout = startTimeout
+        self.callTimeout = callTimeout
+    }
+
     func start() async throws {
         let task: Task<Void, Error> = lock.withLock {
             if let starting { return starting }
@@ -70,22 +87,23 @@ final class ArcDriver: @unchecked Sendable {
             return task
         }
         do { try await task.value } catch {
-            lock.withLock { starting = nil }
+            // Only this start's failure; a newer start may already be under way.
+            lock.withLock { if starting == task { starting = nil } }
             throw error
         }
     }
 
     private func launch() async throws {
-        guard let uvx = Self.uvx() else {
+        guard let command = command() else {
             throw ToolError(code: "not_installed", message: "uv isn't installed, so arc-cua can't run.")
         }
         // A write to a server that just exited must fail, not stop Third Hand.
         signal(SIGPIPE, SIG_IGN)
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: uvx)
-        process.arguments = ["--from", Self.package, "arc-cua", "mcp"]
+        process.executableURL = command.executable
+        process.arguments = command.arguments
         var environment = ProcessInfo.processInfo.environment
-        environment["PATH"] = (uvx as NSString).deletingLastPathComponent + ":/usr/bin:/bin:/usr/sbin:/sbin"
+        environment["PATH"] = command.executable.deletingLastPathComponent().path + ":/usr/bin:/bin:/usr/sbin:/sbin"
         process.environment = environment
         let input = Pipe(), output = Pipe()
         process.standardInput = input
@@ -94,7 +112,7 @@ final class ArcDriver: @unchecked Sendable {
         process.standardError = FileHandle(forWritingAtPath: Self.logPath) ?? FileHandle.nullDevice
         process.terminationHandler = { [weak self] process in
             Log.info("arc-cua exited status=\(process.terminationStatus)")
-            self?.stopped()
+            self?.stopped(process)
         }
         try process.run()
         lock.withLock {
@@ -104,23 +122,41 @@ final class ArcDriver: @unchecked Sendable {
         let reader = Thread { [weak self] in self?.read(output.fileHandleForReading) }
         reader.name = "arc-cua-output"
         reader.start()
-        Log.info("arc-cua launched pid=\(process.processIdentifier) package=\(Self.package)")
+        Log.info("arc-cua launched pid=\(process.processIdentifier) arguments=\(command.arguments.joined(separator: " "))")
         // The first launch may download and build the package.
         let started = Date()
-        _ = try await AsyncTimeout.run(seconds: 120, message: "arc-cua didn't start.") {
-            try await self.request("initialize", ["protocolVersion": "2025-06-18", "capabilities": [:],
-                                                  "clientInfo": ["name": "Third Hand", "version": "1"]])
+        do {
+            _ = try await AsyncTimeout.run(seconds: startTimeout, message: "arc-cua didn't start.") {
+                try await self.request("initialize", ["protocolVersion": "2025-06-18", "capabilities": [:],
+                                                      "clientInfo": ["name": "Third Hand", "version": "1"]])
+            }
+        } catch {
+            // Don't leave a half-started server behind; the next call starts a fresh one.
+            stop(process)
+            throw error
         }
         send(["jsonrpc": "2.0", "method": "notifications/initialized"])
         Log.info("arc-cua ready ms=\(Int(Date().timeIntervalSince(started) * 1000))")
     }
 
-    /// Fails waiting requests; the next call starts a new server.
-    private func stopped() {
-        let waiting = lock.withLock {
+    /// Ends a server: closing its input lets it restore parked windows before exiting; it is killed if it doesn't.
+    private func stop(_ process: Process) {
+        let input = lock.withLock { self.process === process ? self.input : nil }
+        try? input?.close()
+        stopped(process)
+        DispatchQueue.global().asyncAfter(deadline: .now() + 3) {
+            if process.isRunning { process.terminate() }
+        }
+    }
+
+    /// Fails the requests waiting on `process`; the next call starts a new server. A server that was
+    /// already replaced changes nothing.
+    private func stopped(_ process: Process) {
+        let waiting: [CheckedContinuation<[String: Any], Error>] = lock.withLock {
+            guard self.process === process else { return [] }
             let waiting = Array(pending.values)
             pending = [:]
-            process = nil
+            self.process = nil
             input = nil
             starting = nil
             return waiting
@@ -148,15 +184,20 @@ final class ArcDriver: @unchecked Sendable {
     }
 
     private func send(_ message: [String: Any]) {
+        lock.withLock { write(message) }
+    }
+
+    /// Writes one message; the caller holds `lock`, so messages go out whole and in the order they were made.
+    private func write(_ message: [String: Any]) {
         guard let data = try? JSONSerialization.data(withJSONObject: message) else { return }
-        lock.withLock {
-            try? input?.write(contentsOf: data + Data("\n".utf8))
-        }
+        try? input?.write(contentsOf: data + Data("\n".utf8))
     }
 
     // MARK: - Requests
 
     /// One JSON-RPC request. Cancelling the task tells the server to drop it; a cancelled request gets no reply.
+    /// The request is registered and written under one lock, so a cancellation can't reach the server before
+    /// the request it cancels.
     private func request(_ method: String, _ params: [String: Any]) async throws -> [String: Any] {
         let id = lock.withLock { nextID += 1; return nextID }
         return try await withTaskCancellationHandler {
@@ -164,6 +205,7 @@ final class ArcDriver: @unchecked Sendable {
                 let running = lock.withLock {
                     guard input != nil, !Task.isCancelled else { return false }
                     pending[id] = continuation
+                    write(["jsonrpc": "2.0", "id": id, "method": method, "params": params])
                     return true
                 }
                 guard running else {
@@ -171,20 +213,30 @@ final class ArcDriver: @unchecked Sendable {
                         : ToolError(code: "server_stopped", message: "arc-cua isn't running."))
                     return
                 }
-                send(["jsonrpc": "2.0", "id": id, "method": method, "params": params])
             }
         } onCancel: {
-            let continuation = lock.withLock { pending.removeValue(forKey: id) }
-            guard let continuation else { return }
-            send(["jsonrpc": "2.0", "method": "notifications/cancelled", "params": ["requestId": id]])
-            continuation.resume(throwing: CancellationError())
+            let continuation = lock.withLock {
+                let continuation = pending.removeValue(forKey: id)
+                if continuation != nil {
+                    write(["jsonrpc": "2.0", "method": "notifications/cancelled", "params": ["requestId": id]])
+                }
+                return continuation
+            }
+            continuation?.resume(throwing: CancellationError())
         }
     }
 
-    /// Calls a tool and returns its structured result and any image, starting the server if needed.
+    /// Calls a tool and returns its structured result and any image, starting the server if needed. A call that
+    /// takes longer than `callTimeout` (the server stuck on an unresponsive app) restarts the server.
     func callWithImage(_ tool: String, _ arguments: [String: Any] = [:]) async throws -> (result: [String: Any], image: Data?) {
         try await start()
-        let reply = try await request("tools/call", ["name": tool, "arguments": arguments])
+        let server = lock.withLock { process }
+        let reply = try await AsyncTimeout.run(seconds: callTimeout, message: "arc-cua didn't answer \(tool) in time.", onTimeout: {
+            Log.info("arc-cua timed out tool=\(tool); restarting it")
+            if let server { self.stop(server) }
+        }) {
+            try await self.request("tools/call", ["name": tool, "arguments": arguments])
+        }
         if let error = reply["error"] as? [String: Any] {
             throw ToolError(code: "protocol_error", message: error["message"] as? String ?? "arc-cua request failed.")
         }
@@ -230,7 +282,9 @@ final class ArcDriver: @unchecked Sendable {
 
     /// arc elements as Third Hand's: roles regain their AX prefix, arc's ids are kept for acting, and each
     /// element in a row gets the row's other text as context, which tells identical controls apart.
-    nonisolated static func snapshot(_ result: [String: Any]) -> Snapshot {
+    /// In a `terminal`, the text area takes typing although arc offers no TYPE_TEXT (its value isn't
+    /// settable): Third Hand types there with key events.
+    nonisolated static func snapshot(_ result: [String: Any], terminal: Bool = false) -> Snapshot {
         let raw = result["elements"] as? [[String: Any]] ?? []
         var byID: [String: [String: Any]] = [:]
         for element in raw { if let id = element["id"] as? String { byID[id] = element } }
@@ -256,6 +310,7 @@ final class ArcDriver: @unchecked Sendable {
             if let text = text(element), (rowText[row]?.count ?? 0) < 6 { rowText[row, default: []].append(String(text.prefix(60))) }
         }
         var next = 1
+        let window = result["window_id"] as? Int ?? 0
         let elements = raw.compactMap { element -> AccessibilityElement? in
             guard let driverID = element["id"] as? String else { return nil }
             // arc's ids ("ax_14") stay the same while an element exists; keep the number when there is one.
@@ -263,12 +318,16 @@ final class ArcDriver: @unchecked Sendable {
             next += 1
             let label = element["name"] as? String
             let value = element["value"].map { "\($0)" }
+            let role = "AX" + (element["role"] as? String ?? "Unknown")
+            var actions = element["actions"] as? [String] ?? []
+            if terminal, role == "AXTextArea", !actions.contains("TYPE_TEXT") { actions.append("TYPE_TEXT") }
             var mapped = AccessibilityElement(
-                id: number, role: "AX" + (element["role"] as? String ?? "Unknown"),
+                id: number, role: role,
                 label: label.flatMap { $0.isEmpty ? nil : $0 }, value: value,
-                enabled: element["enabled"] as? Bool ?? true, actions: element["actions"] as? [String] ?? [],
+                enabled: element["enabled"] as? Bool ?? true, actions: actions,
                 axElement: nil, focused: element["focused"] as? Bool ?? false)
-            mapped.driverID = driverID
+            // arc numbers elements per window, so the window is part of the identity.
+            mapped.driverID = "\(window)/\(driverID)"
             if let row = rowOf[driverID], let texts = rowText[row] {
                 let own = mapped.displayLabel
                 let context = texts.filter { $0 != own }.joined(separator: " · ")
@@ -276,7 +335,7 @@ final class ArcDriver: @unchecked Sendable {
             }
             return mapped
         }
-        return Snapshot(id: result["snapshot"] as? String ?? "", windowID: result["window_id"] as? Int ?? 0, elements: elements)
+        return Snapshot(id: result["snapshot"] as? String ?? "", windowID: window, elements: elements)
     }
 
     /// A Third Hand key and modifiers ("return", ["command"]) as an arc chord ("MOD+ENTER").

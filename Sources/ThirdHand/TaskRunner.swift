@@ -371,6 +371,9 @@ final class TaskRunner: ActionLayer {
             throw ControllerError.invalid("Stopped after \(maxSteps) actions. The final screen does not confirm completion.")
         }
         if !background { try await bringToFront() }
+        // Each step reads the app's current window, so one the app just opened and focused is followed;
+        // within the step, reads stay on that window.
+        arcWindow = nil
         var latest: [AccessibilityElement] = []
         // A planned target may not be on screen yet (results loading, a menu opening): keep looking while
         // the screen is still changing, up to a few seconds, before asking Jev or the planner.
@@ -522,8 +525,9 @@ final class TaskRunner: ActionLayer {
             }
             catch is CancellationError { throw CancellationError() }
             catch let changed as ArcDriver.Changed {
-                // Nothing was done; decide again on the app as it is now.
+                // Nothing was done; decide again on the app as it is now, without counting this as an attempt.
                 actions -= 1
+                progress.retract()
                 history.append(ActionHistory(action: "OBSERVE", result: "The app changed before the action (\(changed.status)); discarded it."))
                 continue
             }
@@ -684,7 +688,7 @@ final class TaskRunner: ActionLayer {
     /// An observation of an arc-cua snapshot (from `observe`, or the fresh one an input settled on),
     /// with OCR text added when recovery turned it on.
     private func observation(from result: [String: Any], arc: ArcDriver) async throws -> Observation {
-        let snapshot = ArcDriver.snapshot(result)
+        let snapshot = ArcDriver.snapshot(result, terminal: target.isTerminal)
         arcWindow = snapshot.windowID
         var elements = snapshot.elements
         try checkFocus()
@@ -897,10 +901,10 @@ final class TaskRunner: ActionLayer {
             if settle { arcSettled = result }
         }
         func act(_ action: String, _ extra: [String: Any] = [:]) async throws {
-            guard let id = element?.driverID else { throw ControllerError.invalid("No control was selected.") }
+            guard let id = element?.driverElementID else { throw ControllerError.invalid("No control was selected.") }
             try await send("act", ["snapshot": snapshot, "action": action, "element": id].merging(extra) { $1 })
         }
-        func press(_ key: String, _ modifiers: [String] = [], settle: Bool = true) async throws {
+        func press(_ key: String, _ modifiers: [String] = [], settle: Bool = ArcDriver.settles) async throws {
             guard let keys = ArcDriver.chord(key: key, modifiers: modifiers) else { throw ControllerError.invalid("Unsupported key") }
             try await send("press", ["pid": pid, "window_id": window, "keys": keys, "snapshot": snapshot], settle: settle)
         }

@@ -15,9 +15,12 @@ struct AccessibilityElement {
     var context: String? = nil
     /// A stable page selector (e.g. data-testid) when read through a debugging connection.
     var selector: String? = nil
-    /// arc-cua's id for the element, stable while it exists; set when arc-cua read the window.
-    /// `actions` then holds arc's action names (CLICK, TYPE_TEXT…), not accessibility actions.
+    /// "window/element" for an element arc-cua read: arc's element ids are stable while the element exists,
+    /// within one window. `actions` then holds arc's action names (CLICK, TYPE_TEXT…), not accessibility actions.
     var driverID: String? = nil
+
+    /// The id arc-cua's tools take for this element ("ax_14").
+    var driverElementID: String? { driverID.map { String($0.split(separator: "/").last ?? Substring($0)) } }
 
     /// Preserve outcome evidence alongside actionable controls when trimming a screen.
     var isOutcomeEvidence: Bool {

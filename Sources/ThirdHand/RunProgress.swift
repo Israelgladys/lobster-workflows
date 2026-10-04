@@ -24,7 +24,8 @@ enum ObservationState {
 
     static func matching(_ target: AccessibilityElement, in elements: [AccessibilityElement]) -> AccessibilityElement? {
         if let ax = target.axElement, let exact = elements.first(where: { $0.axElement.map { CFEqual(ax, $0) } ?? false }) { return exact }
-        if let id = target.driverID { return elements.first { $0.driverID == id } }
+        // arc's id identifies the element while it exists; a rebuilt element is matched like any other below.
+        if let id = target.driverID, let same = elements.first(where: { $0.driverID == id }) { return same }
         let matches = elements.filter { $0.source == target.source && $0.role == target.role && $0.displayLabel == target.displayLabel }
         if matches.count == 1 { return matches[0] }
         if let frame = target.frame {
@@ -95,6 +96,13 @@ struct RunProgress {
         actions.append(action)
         pendingTarget = targetState
         return nil
+    }
+
+    /// Forgets the action `problem` just admitted, when it turned out not to be sent (the app changed first).
+    mutating func retract() {
+        if !pairs.isEmpty { pairs.removeLast() }
+        if !actions.isEmpty { actions.removeLast() }
+        pendingTarget = nil
     }
 
     /// The planner was told about the failures and will choose a different step.
