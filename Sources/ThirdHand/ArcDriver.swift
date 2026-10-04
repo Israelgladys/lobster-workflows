@@ -63,9 +63,21 @@ final class ArcDriver: @unchecked Sendable {
             .first { FileManager.default.isExecutableFile(atPath: $0) }
     }
 
-    /// The server to run: `uvx` with the pinned package, or nil when uv isn't installed.
+    /// The Python and arc-cua shipped in the app (Scripts/bundle-arc-cua.sh), when present.
+    nonisolated static var bundledPython: URL? {
+        guard let url = Bundle.main.resourceURL?.appendingPathComponent("arc-cua/python/bin/python3"),
+              FileManager.default.isExecutableFile(atPath: url.path) else { return nil }
+        return url
+    }
+
+    /// The server to run: the bundled runtime, or `uvx` with the pinned package (a development build, or an
+    /// `ArcPackage` override). Nil when neither is available.
     nonisolated static func defaultCommand() -> (executable: URL, arguments: [String])? {
-        uvx().map { (URL(fileURLWithPath: $0), ["--from", package, "arc-cua", "mcp"]) }
+        // -I ignores the user's Python environment; -B writes no bytecode into the signed app.
+        if UserDefaults.standard.string(forKey: "ArcPackage") == nil, let python = bundledPython {
+            return (python, ["-I", "-B", "-m", "arc_cua", "mcp"])
+        }
+        return uvx().map { (URL(fileURLWithPath: $0), ["--from", package, "arc-cua", "mcp"]) }
     }
 
     private let command: () -> (executable: URL, arguments: [String])?
@@ -96,7 +108,7 @@ final class ArcDriver: @unchecked Sendable {
 
     private func launch() async throws {
         guard let command = command() else {
-            throw ToolError(code: "not_installed", message: "uv isn't installed, so arc-cua can't run.")
+            throw ToolError(code: "not_installed", message: "arc-cua isn't in this build and uv isn't installed, so arc-cua can't run.")
         }
         // A write to a server that just exited must fail, not stop Third Hand.
         signal(SIGPIPE, SIG_IGN)
