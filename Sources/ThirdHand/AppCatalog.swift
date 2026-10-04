@@ -99,9 +99,23 @@ final class AppCatalog: ObservableObject {
         while Date() < deadline {
             try Task.checkCancellation()
             if WindowSnapshot.frontWindow(pid: launched.processIdentifier) != nil { return launched }
-            if hidden, !WindowParking.windows(of: AXUIElementCreateApplication(launched.processIdentifier)).isEmpty { return launched }
+            if hidden, !WindowSnapshot.axWindows(of: AXUIElementCreateApplication(launched.processIdentifier)).isEmpty { return launched }
             try await Task.sleep(nanoseconds: 250_000_000)
         }
         throw ControllerError.invalid("\(app.name) didn't open a window in time.")
+    }
+
+    /// Some apps bring themselves forward as they finish launching; this hands the front back to the
+    /// user's app for a few seconds after a background launch.
+    static func keepBehind(_ app: NSRunningApplication, restoring previous: NSRunningApplication?, for seconds: Double = 3) async {
+        guard let previous, previous.processIdentifier != app.processIdentifier else { return }
+        let deadline = Date().addingTimeInterval(seconds)
+        while Date() < deadline, !Task.isCancelled {
+            if NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier {
+                Log.info("Launched app took the front; restoring the user's app")
+                previous.activate()
+            }
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
     }
 }

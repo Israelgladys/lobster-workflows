@@ -39,11 +39,6 @@ final class TaskRunner: ActionLayer {
     private var timedOut = false
     nonisolated static let activeTimeLimit: TimeInterval = 300
     private var actions = 0
-    /// The user's front app and the time of the last input addressed to the target's window.
-    private var userApp: NSRunningApplication?
-    private var lastWindowInput = Date.distantPast
-    /// A minimized or hidden window brought onto an invisible display for the task.
-    private var parking: WindowParking?
     /// arc-cua's driver for background control without a debugging connection, and the window it reads.
     private var arc: ArcDriver?
     private var arcWindow: Int?
@@ -108,13 +103,9 @@ final class TaskRunner: ActionLayer {
         }
         defer { watchdog.cancel() }
         await report()
-        if let parking {
-            // A stopped task is cancelled; restoring runs in its own task so it still completes.
-            await Task { await parking.restore() }.value
-            self.parking = nil
-        }
         if let arc {
             let pid = Int(target.pid)
+            // A stopped task is cancelled; releasing runs in its own task so it still completes.
             await Task {
                 do {
                     let released = try await arc.call("release", ["pid": pid])["released"] as? [Int] ?? []
@@ -146,30 +137,14 @@ final class TaskRunner: ActionLayer {
         guard AXIsProcessTrusted() else { throw ControllerError.invalid("Enable Accessibility for Third Hand in System Settings.") }
         try checkFocus()
         let debugPort = background ? await ElectronDetector.findDebugPort(pid: target.pid) : nil
-        if background, debugPort == nil, let driver = await ArcDriver.connect() {
+        if background, debugPort == nil {
             // arc-cua finds the window itself, including a minimized one or a hidden app's.
+            guard let driver = await ArcDriver.connect() else {
+                throw ControllerError.invalid("Background control needs arc-cua, which couldn't start. Run the task on screen, or see ~/Library/Logs/Third Hand arc-cua.log.")
+            }
             try checkFocus()
             arc = driver
             Log.info("Background control via=arc")
-        } else if background, debugPort == nil {
-            try BackgroundInput.ensureAvailable()
-            func needsParking() -> Bool {
-                target.application.isHidden || (WindowSnapshot.frontWindow(pid: target.pid) == nil
-                    && WindowParking.windows(of: target.appElement).contains { WindowParking.bool($0, kAXMinimizedAttribute) })
-            }
-            // A window that just opened may still be moving into place.
-            for _ in 0..<20 where WindowSnapshot.frontWindow(pid: target.pid) == nil && !needsParking() {
-                try checkFocus()
-                try await Task.sleep(nanoseconds: 250_000_000)
-            }
-            if needsParking() {
-                delegate?.taskRunner(self, status: "Opening \(target.name) out of sight…")
-                let parking = WindowParking(target: target)
-                self.parking = parking
-                try await parking.park(appName: target.name)
-            }
-            Log.info("Background control via=window_input")
-            watchForActivation()
         } else if background, let port = debugPort {
             // Right after a relaunch the page is still loading and the window may still be settling.
             var lastError: Error?
@@ -799,95 +774,6 @@ final class TaskRunner: ActionLayer {
         }
     }
 
-    /// Some controls activate their app when used, even from the background (WebKit does on focus).
-    /// Hands the front back to the user's app when that follows an input; switching to the app later
-    /// is the user's choice and is left alone.
-    private func watchForActivation() {
-        Task { [weak self] in
-            while let self, self.active, !Task.isCancelled {
-                if NSWorkspace.shared.frontmostApplication?.processIdentifier == self.target.pid,
-                   Date().timeIntervalSince(self.lastWindowInput) < 1.5, let user = self.userApp {
-                    Log.info("Target took the front after input; restoring the user's app")
-                    user.activate()
-                }
-                try? await Task.sleep(nanoseconds: 100_000_000)
-            }
-        }
-    }
-
-    /// Background input for apps without a debugging connection: accessibility actions first, then
-    /// events addressed to the target window. The user's pointer, front app and key window stay put.
-    private func executeInWindow(_ decision: AgentDecision, elements: [AccessibilityElement],
-                                 windowID: CGWindowID, windowFrame: CGRect?) async throws {
-        let element = elements.first { String($0.id) == decision.targetIndex }
-        let point = element?.screenFrame().map { CGPoint(x: $0.midX, y: $0.midY) }
-        func click(count: Int = 1, right: Bool = false) throws {
-            guard let point else { throw ControllerError.invalid("The selected control did not expose a clickable position.") }
-            guard let windowFrame, windowFrame.contains(point) else { throw ControllerError.invalid("Target is outside the current window") }
-            try BackgroundInput.click(pid: target.pid, window: windowID, at: point, count: count, right: right)
-        }
-        func focusedElement() -> AXUIElement? {
-            var value: CFTypeRef?
-            guard AXUIElementCopyAttributeValue(target.appElement, kAXFocusedUIElementAttribute as CFString, &value) == .success,
-                  let value, CFGetTypeID(value) == AXUIElementGetTypeID() else { return nil }
-            return (value as! AXUIElement)
-        }
-        if let front = NSWorkspace.shared.frontmostApplication, front.processIdentifier != target.pid { userApp = front }
-        lastWindowInput = Date()
-        defer { lastWindowInput = Date() }
-        try checkFocus()
-        switch decision.operation {
-        case "CLICK", "CLICK_TEXT":
-            if let element, let ax = element.axElement {
-                for action in ["AXPress", "AXOpen", "AXConfirm", "AXPick"] where element.actions.contains(action) {
-                    if AXUIElementPerformAction(ax, action as CFString) == .success { return }
-                }
-            }
-            try click()
-        case "DOUBLE_CLICK": try click(count: 2)
-        case "RIGHT_CLICK": try click(right: true)
-        case "TYPE_TEXT":
-            guard let text = decision.textValue else { throw ControllerError.invalid("Missing text") }
-            guard let element, let ax = element.axElement else { throw ControllerError.invalid("No editable field was selected.") }
-            phase = "confirming_field_focus"
-            // Focus by clicking: setting AXFocused activates some apps (Safari does).
-            try await TextFieldFocus.prepare(check: checkFocus, probe: { TextFieldFocus.confirmed(ax, app: self.target.appElement) },
-                                             requestFocus: { try click() }, click: { try click() })
-            if target.isTerminal {
-                // Readline-style editing for a shell prompt.
-                try BackgroundInput.press(pid: target.pid, window: windowID, key: "a", modifiers: ["control"])
-                try BackgroundInput.press(pid: target.pid, window: windowID, key: "k", modifiers: ["control"])
-            } else if !(element.value ?? "").isEmpty, !BackgroundInput.selectAll(in: focusedElement() ?? ax) {
-                throw ControllerError.invalid("The field's existing text couldn't be selected in the background. No text was entered.")
-            }
-            phase = "typing_text"
-            try await BackgroundInput.type(pid: target.pid, window: windowID, text: text) {
-                try self.checkFocus()
-                guard TextFieldFocus.confirmed(ax, app: self.target.appElement) else { throw TextFieldFocus.Failure.changed }
-            }
-            if target.isTerminal { terminalInputPending = true }
-        case "KEY_PRESS":
-            let key = decision.key!, modifiers = decision.modifiers ?? []
-            // Menu key equivalents only reach the front app, so ⌘ shortcuts go through the menu when one
-            // matches. Others, like ⌘↓ in a text view, are ordinary keys the window handles itself.
-            let command = modifiers.contains("command")
-            if command, key.lowercased() == "a", modifiers == ["command"], let field = focusedElement(), BackgroundInput.selectAll(in: field) {
-                Log.info("Background shortcut via=select_all")
-            } else if command, BackgroundInput.menuShortcut(app: target.appElement, key: key, modifiers: modifiers) {
-                Log.info("Background shortcut via=menu")
-            } else {
-                try BackgroundInput.press(pid: target.pid, window: windowID, key: key, modifiers: modifiers)
-            }
-            terminalInputPending = false
-        case "SCROLL_UP", "SCROLL_DOWN":
-            guard let frame = windowFrame else { throw ControllerError.invalid("No window to scroll") }
-            try BackgroundInput.scroll(pid: target.pid, window: windowID, at: point ?? CGPoint(x: frame.midX, y: frame.midY),
-                                       lines: decision.operation == "SCROLL_UP" ? 5 : -5)
-        case "WAIT": try await Task.sleep(nanoseconds: 700_000_000)
-        default: throw ControllerError.invalid("Unsupported operation")
-        }
-    }
-
     /// Input through arc-cua, checked against `snapshot` when it runs. Throws `ArcDriver.Changed` when the app
     /// changed under the snapshot and nothing was done. The step's last input settles, leaving `arcSettled`.
     private func executeWithArc(_ arc: ArcDriver, _ decision: AgentDecision, elements: [AccessibilityElement],
@@ -951,10 +837,8 @@ final class TaskRunner: ActionLayer {
                          snapshot: String? = nil) async throws {
         if background {
             if cdpClient != nil { return try await executeInBackground(decision) }
-            if let arc {
-                return try await executeWithArc(arc, decision, elements: elements, windowID: windowID, snapshot: snapshot)
-            }
-            return try await executeInWindow(decision, elements: elements, windowID: windowID, windowFrame: windowFrame)
+            guard let arc else { throw ControllerError.invalid("The background connection closed.") }
+            return try await executeWithArc(arc, decision, elements: elements, windowID: windowID, snapshot: snapshot)
         }
         let element = elements.first { String($0.id) == decision.targetIndex }
         let point: CGPoint?

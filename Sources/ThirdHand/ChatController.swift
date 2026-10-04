@@ -139,8 +139,8 @@ final class ChatController: ObservableObject, TaskRunnerDelegate {
     }
 
     /// Opens the app for the task. A background task runs through a Chromium app's debugging connection
-    /// when it already has one, and otherwise with input addressed to the app's window. Where that input
-    /// isn't available, Chromium apps can be relaunched with debugging and other apps run on screen.
+    /// when it already has one, and otherwise through arc-cua. Where arc-cua can't run, Chromium apps can be
+    /// relaunched with debugging and other apps run on screen.
     private func launch(for job: Job) async throws -> (NSRunningApplication, background: Bool) {
         guard job.mode == .background else { return (try await AppCatalog.prepare(job.app), false) }
         let running = NSRunningApplication.runningApplications(withBundleIdentifier: job.app.bundleID).first { !$0.isTerminated }
@@ -149,15 +149,15 @@ final class ChatController: ObservableObject, TaskRunnerDelegate {
             // Background control talks to the page directly; reopening the window would bring the app forward.
             return (running, true)
         }
-        if SkyLight.isAvailable {
-            // Minimized or hidden windows are brought up out of sight by the task; asking the app to
-            // reopen would show them on screen.
-            if let running, !WindowParking.windows(of: AXUIElementCreateApplication(running.processIdentifier)).isEmpty {
+        if await ArcDriver.connect() != nil {
+            // arc-cua brings minimized or hidden windows up out of sight; asking the app to reopen would
+            // show them on screen.
+            if let running, !WindowSnapshot.axWindows(of: AXUIElementCreateApplication(running.processIdentifier)).isEmpty {
                 return (running, true)
             }
             let previous = NSWorkspace.shared.frontmostApplication
             let app = try await AppCatalog.prepare(job.app, hidden: running == nil)
-            Task { await BackgroundInput.keepBehind(app, restoring: previous) }
+            Task { await AppCatalog.keepBehind(app, restoring: previous) }
             return (app, true)
         }
         guard ElectronDetector.supportsDebugging(bundleID: job.app.bundleID) else {

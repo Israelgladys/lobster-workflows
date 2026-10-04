@@ -7,6 +7,13 @@ struct WindowSnapshot {
     let frame: CGRect // Global Quartz coordinates, top-left origin.
     let image: CGImage?
 
+    /// All of an app's windows that accessibility reports, including minimized ones and a hidden app's.
+    nonisolated static func axWindows(of app: AXUIElement) -> [AXUIElement] {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &value) == .success else { return [] }
+        return (value as? [AXUIElement]) ?? []
+    }
+
     static func frontWindow(pid: pid_t) -> (id: CGWindowID, frame: CGRect)? {
         guard let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else { return nil }
         let candidates: [(id: CGWindowID, frame: CGRect)] = windows.compactMap { window in

@@ -36,7 +36,8 @@ final class ArcDriver: @unchecked Sendable {
     private var pending: [Int: CheckedContinuation<[String: Any], Error>] = [:]
     private var starting: Task<Void, Error>?
 
-    /// The driver when it's enabled, running and able to work in the background; nil means use the built-in path.
+    /// The driver when it's enabled, running and able to work in the background; nil means background control
+    /// is unavailable (Chromium apps can still use a debugging connection; others run on screen).
     static func connect() async -> ArcDriver? {
         guard enabled else { return nil }
         do {
