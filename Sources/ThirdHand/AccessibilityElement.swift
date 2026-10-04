@@ -15,6 +15,9 @@ struct AccessibilityElement {
     var context: String? = nil
     /// A stable page selector (e.g. data-testid) when read through a debugging connection.
     var selector: String? = nil
+    /// arc-cua's id for the element, stable while it exists; set when arc-cua read the window.
+    /// `actions` then holds arc's action names (CLICK, TYPE_TEXT…), not accessibility actions.
+    var driverID: String? = nil
 
     /// Preserve outcome evidence alongside actionable controls when trimming a screen.
     var isOutcomeEvidence: Bool {

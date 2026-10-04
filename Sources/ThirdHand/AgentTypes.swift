@@ -42,7 +42,8 @@ struct AgentDecision: Codable, Equatable {
         }
         if operation == "TYPE_TEXT" {
             if let targetIndex, let target = elements.first(where: { String($0.id) == targetIndex }) {
-                guard ["AXTextField", "AXTextArea", "AXComboBox"].contains(target.role) else {
+                guard target.driverID != nil ? target.actions.contains("TYPE_TEXT")
+                        : ["AXTextField", "AXTextArea", "AXComboBox"].contains(target.role) else {
                     throw ControllerError.invalid("Text action requires an editable field")
                 }
             }

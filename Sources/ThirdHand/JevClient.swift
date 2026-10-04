@@ -41,7 +41,11 @@ final class JevClient {
                 if element.frame != nil { textRegions[id] = element }
                 continue
             }
-            if ["AXTextField", "AXTextArea", "AXComboBox"].contains(element.role) {
+            if element.driverID != nil {
+                // arc-cua lists exactly what each element offers.
+                if element.actions.contains("TYPE_TEXT") { type[id] = element }
+                if element.actions.contains("CLICK") { click[id] = element }
+            } else if ["AXTextField", "AXTextArea", "AXComboBox"].contains(element.role) {
                 type[id] = element
                 click[id] = element
             } else if clickRoles.contains(element.role) ||

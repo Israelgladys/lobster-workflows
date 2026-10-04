@@ -24,6 +24,7 @@ enum ObservationState {
 
     static func matching(_ target: AccessibilityElement, in elements: [AccessibilityElement]) -> AccessibilityElement? {
         if let ax = target.axElement, let exact = elements.first(where: { $0.axElement.map { CFEqual(ax, $0) } ?? false }) { return exact }
+        if let id = target.driverID { return elements.first { $0.driverID == id } }
         let matches = elements.filter { $0.source == target.source && $0.role == target.role && $0.displayLabel == target.displayLabel }
         if matches.count == 1 { return matches[0] }
         if let frame = target.frame {

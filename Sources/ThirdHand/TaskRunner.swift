@@ -44,6 +44,9 @@ final class TaskRunner: ActionLayer {
     private var lastWindowInput = Date.distantPast
     /// A minimized or hidden window brought onto an invisible display for the task.
     private var parking: WindowParking?
+    /// arc-cua's driver for background control without a debugging connection, and the window it reads.
+    private var arc: ArcDriver?
+    private var arcWindow: Int?
     private lazy var jev = JevClient(apiKey: apiKey)
 
     init(target: AppTarget, goal: String, apiKey: String, credentials: CodexCredentials, context: [String] = [],
@@ -108,6 +111,16 @@ final class TaskRunner: ActionLayer {
             await Task { await parking.restore() }.value
             self.parking = nil
         }
+        if let arc {
+            let pid = Int(target.pid)
+            await Task {
+                do {
+                    let released = try await arc.call("release", ["pid": pid])["released"] as? [Int] ?? []
+                    if !released.isEmpty { Log.info("arc-cua released parked windows") }
+                } catch { Log.info("arc-cua release failed: \(error.localizedDescription)") }
+            }.value
+            self.arc = nil
+        }
     }
 
     private func report() async {
@@ -131,7 +144,12 @@ final class TaskRunner: ActionLayer {
         guard AXIsProcessTrusted() else { throw ControllerError.invalid("Enable Accessibility for Third Hand in System Settings.") }
         try checkFocus()
         let debugPort = background ? await ElectronDetector.findDebugPort(pid: target.pid) : nil
-        if background, debugPort == nil {
+        if background, debugPort == nil, let driver = await ArcDriver.connect() {
+            // arc-cua finds the window itself, including a minimized one or a hidden app's.
+            try checkFocus()
+            arc = driver
+            Log.info("Background control via=arc")
+        } else if background, debugPort == nil {
             try BackgroundInput.ensureAvailable()
             func needsParking() -> Bool {
                 target.application.isHidden || (WindowSnapshot.frontWindow(pid: target.pid) == nil
@@ -496,8 +514,17 @@ final class TaskRunner: ActionLayer {
             RunMetrics.current.action(fast: fastSettle)
             phase = "executing_\(decision.operation)"
             var executionError: String?
-            do { try await execute(decision, elements: observation.elements, windowID: observation.windowID, windowFrame: observation.frame) }
+            do {
+                try await execute(decision, elements: observation.elements, windowID: observation.windowID,
+                                  windowFrame: observation.frame, snapshot: observation.snapshot)
+            }
             catch is CancellationError { throw CancellationError() }
+            catch let changed as ArcDriver.Changed {
+                // Nothing was done; decide again on the app as it is now.
+                actions -= 1
+                history.append(ActionHistory(action: "OBSERVE", result: "The app changed before the action (\(changed.status)); discarded it."))
+                continue
+            }
             catch {
                 try checkFocus()
                 executionError = error.localizedDescription
@@ -577,17 +604,21 @@ final class TaskRunner: ActionLayer {
         let elements: [AccessibilityElement]
         let windowID: CGWindowID
         let frame: CGRect
+        /// arc-cua's snapshot the elements came from; input names it, and arc refuses it if the app changed since.
+        var snapshot: String? = nil
     }
 
     private func isCurrent(_ observation: Observation) -> Bool {
         // The debugging connection addresses the page, not a window, which may be hidden or minimized.
-        if background && cdpClient != nil { return true }
+        // arc-cua checks its snapshot against the app when it acts.
+        if background && (cdpClient != nil || arc != nil) { return true }
         guard let window = WindowSnapshot.frontWindow(pid: target.pid) else { return false }
         return window.id == observation.windowID && window.frame == observation.frame
     }
 
     private func observe() async throws -> Observation {
         try checkFocus()
+        if let arc { return try await observe(with: arc) }
         let visibleWindow = WindowSnapshot.frontWindow(pid: target.pid)
         guard let window = visibleWindow ?? (background && cdpClient != nil ? (id: 0, frame: .zero) : nil) else {
             throw ControllerError.invalid(background
@@ -620,6 +651,50 @@ final class TaskRunner: ActionLayer {
         }
         Log.info("Observation window=\(window.id) width=\(Int(window.frame.width)) height=\(Int(window.frame.height)) count=\(elements.count) capped=\(elements.count >= 500) ocr=\(useOCR)")
         return result
+    }
+
+    /// Reads the task's window through arc-cua. The first read picks the app's window and later reads stay
+    /// on it; if it closes or is replaced, the app is read again.
+    private func observe(with arc: ArcDriver) async throws -> Observation {
+        var result: [String: Any]?
+        for attempt in 0..<12 {
+            var arguments: [String: Any] = ["pid": Int(target.pid)]
+            if let arcWindow { arguments["window_id"] = arcWindow }
+            do {
+                result = try await arc.call("observe", arguments)
+                break
+            } catch let error as ArcDriver.ToolError where error.code == "target_unavailable" {
+                if arcWindow != nil {
+                    Log.info("arc-cua window gone; reading the app again")
+                    arcWindow = nil
+                    continue
+                }
+                // A window that just opened may still be on its way.
+                guard attempt < 11 else { throw error }
+                try checkFocus()
+                try await Task.sleep(nanoseconds: 250_000_000)
+            }
+        }
+        guard let result else { throw ControllerError.invalid("\(target.name) has no window Third Hand can reach.") }
+        let snapshot = ArcDriver.snapshot(result)
+        arcWindow = snapshot.windowID
+        var elements = snapshot.elements
+        try checkFocus()
+        if useOCR {
+            let (shot, png) = try await arc.callWithImage("screenshot", ["pid": Int(target.pid), "window_id": snapshot.windowID,
+                                                                         "snapshot": snapshot.id])
+            let info = shot["screenshot"] as? [String: Any]
+            guard let png, let image = NSBitmapImageRep(data: png)?.cgImage,
+                  let scale = (info?["scale"] as? Double).flatMap({ $0 > 0 ? $0 : nil }) else {
+                throw ControllerError.invalid("Local screen reading couldn't capture \(target.name).")
+            }
+            // Frames in window points, as click_at takes them.
+            let window = CGRect(x: 0, y: 0, width: Double(image.width) / scale, height: Double(image.height) / scale)
+            let ocr = try VisionObserver.extractElements(from: image, windowFrame: window)
+            elements = VisionObserver.merging(ocr: ocr, with: elements)
+        }
+        Log.info("Observation via=arc window=\(snapshot.windowID) count=\(elements.count) ocr=\(useOCR)")
+        return Observation(elements: elements, windowID: CGWindowID(snapshot.windowID), frame: .zero, snapshot: snapshot.id)
     }
 
     private func settle(after decision: AgentDecision, before: Observation) async throws -> Observation {
@@ -775,9 +850,67 @@ final class TaskRunner: ActionLayer {
         }
     }
 
-    private func execute(_ decision: AgentDecision, elements: [AccessibilityElement], windowID: CGWindowID, windowFrame: CGRect?) async throws {
+    /// Input through arc-cua, checked against `snapshot` when it runs. Throws `ArcDriver.Changed` when the app
+    /// changed under the snapshot and nothing was done.
+    private func executeWithArc(_ arc: ArcDriver, _ decision: AgentDecision, elements: [AccessibilityElement],
+                                windowID: CGWindowID, snapshot: String?) async throws {
+        guard let snapshot else { throw ControllerError.invalid("No current reading of \(target.name) to act on.") }
+        let element = elements.first { String($0.id) == decision.targetIndex }
+        let pid = Int(target.pid), window = Int(windowID)
+        func act(_ action: String, _ extra: [String: Any] = [:]) async throws {
+            guard let id = element?.driverID else { throw ControllerError.invalid("No control was selected.") }
+            try await arc.input("act", ["snapshot": snapshot, "action": action, "element": id].merging(extra) { $1 })
+        }
+        func press(_ key: String, _ modifiers: [String] = []) async throws {
+            guard let keys = ArcDriver.chord(key: key, modifiers: modifiers) else { throw ControllerError.invalid("Unsupported key") }
+            try await arc.input("press", ["pid": pid, "window_id": window, "keys": keys, "snapshot": snapshot])
+        }
+        try checkFocus()
+        switch decision.operation {
+        case "CLICK": try await act("CLICK")
+        case "DOUBLE_CLICK": try await act("DOUBLE_CLICK")
+        case "RIGHT_CLICK": try await act("RIGHT_CLICK")
+        case "CLICK_TEXT":
+            // OCR text has a frame in window points and no element to name.
+            guard let frame = element?.frame else { throw ControllerError.invalid("The selected text has no position.") }
+            try await arc.input("click_at", ["pid": pid, "window_id": window, "x": frame.midX, "y": frame.midY, "snapshot": snapshot])
+        case "TYPE_TEXT":
+            guard let text = decision.textValue else { throw ControllerError.invalid("Missing text") }
+            if target.isTerminal {
+                // Readline-style editing for a shell prompt, typed where the terminal has key focus.
+                try await press("a", ["control"])
+                try await press("k", ["control"])
+                try await arc.input("type_text", ["pid": pid, "window_id": window, "text": text])
+                terminalInputPending = true
+            } else {
+                try await act("TYPE_TEXT", ["value": text])
+            }
+        case "KEY_PRESS":
+            try await press(decision.key!, decision.modifiers ?? [])
+            terminalInputPending = false
+        case "SCROLL_UP", "SCROLL_DOWN":
+            let up = decision.operation == "SCROLL_UP"
+            if element?.actions.contains("SCROLL") == true {
+                try await act("SCROLL", ["direction": up ? "UP" : "DOWN"])
+            } else {
+                let windows = try await arc.call("windows", ["pid": pid])["windows"] as? [[String: Any]] ?? []
+                let bounds = windows.first { $0["window_id"] as? Int == window }?["bounds"] as? [String: Any]
+                let width = bounds?["width"] as? Double ?? 400, height = bounds?["height"] as? Double ?? 400
+                try await arc.input("scroll_at", ["pid": pid, "window_id": window, "x": width / 2, "y": height / 2,
+                                                  "dy": up ? 300 : -300, "snapshot": snapshot])
+            }
+        case "WAIT": try await Task.sleep(nanoseconds: 700_000_000)
+        default: throw ControllerError.invalid("Unsupported operation")
+        }
+    }
+
+    private func execute(_ decision: AgentDecision, elements: [AccessibilityElement], windowID: CGWindowID, windowFrame: CGRect?,
+                         snapshot: String? = nil) async throws {
         if background {
             if cdpClient != nil { return try await executeInBackground(decision) }
+            if let arc {
+                return try await executeWithArc(arc, decision, elements: elements, windowID: windowID, snapshot: snapshot)
+            }
             return try await executeInWindow(decision, elements: elements, windowID: windowID, windowFrame: windowFrame)
         }
         let element = elements.first { String($0.id) == decision.targetIndex }
